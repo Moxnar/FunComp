@@ -1,0 +1,93 @@
+#include "see.h"
+#include "attacks.h"
+#include <algorithm>
+#include <bit>
+
+namespace {
+bool is_castling(const Position& pos, Move m) {
+    const Piece p = pos.piece_at(m.from());
+    return (p == WK || p == BK) && (m.to() - m.from() == 2 || m.from() - m.to() == 2);
+}
+
+// Material won by the side to move through the exchange that `m` starts,
+// by the gain-array swap algorithm (Chess Programming Wiki, "SEE - The
+// Swap Algorithm"). The captures are first played out to the end with
+// each side's least valuable attacker, recording the running material
+// balance. A minimax pass from the end then lets each side stop at the
+// best point for it. The whole sequence is always played out: exchanges
+// are short, and stopping early is easy to get subtly wrong.
+int see(const Position& pos, Move m) {
+    const int to = m.to();
+    const Piece victim = pos.piece_at(to);
+
+    // gain[d]: material for the side making capture d (the move itself is
+    // capture 0), if the exchange stops right after it.
+    int gain[32];
+    int d = 0;
+    gain[0] = victim == NO_PIECE ? 0 : SEE_VALUE[victim % 6];
+    int on_square = SEE_VALUE[pos.piece_at(m.from()) % 6];  // piece now standing on `to`
+
+    Bitboard occupied = pos.occupied() ^ bit(m.from());
+    Bitboard attackers = pos.attackers_to(to, occupied) & occupied;
+    const Bitboard diagonal = pos.pieces(WB) | pos.pieces(BB) | pos.pieces(WQ) | pos.pieces(BQ);
+    const Bitboard orthogonal = pos.pieces(WR) | pos.pieces(BR) | pos.pieces(WQ) | pos.pieces(BQ);
+    Color side = opposite(pos.side_to_move());
+
+    while (d < 31) {
+        const Bitboard ours = attackers & pos.occupancy(side);
+        if (!ours) break;
+
+        // Least valuable attacker.
+        int pt = 0;
+        Bitboard from_set = 0;
+        for (; pt < 6; ++pt) {
+            from_set = ours & pos.pieces(static_cast<Piece>(piece_index(side, static_cast<PieceType>(pt))));
+            if (from_set) break;
+        }
+
+        occupied ^= bit(std::countr_zero(from_set));
+        // Sliders lined up behind the piece that just left join in. A pawn,
+        // bishop or queen can only have hidden a diagonal slider, a rook or
+        // queen an orthogonal one; a knight or king hides nothing.
+        if (pt == 0 || pt == 2 || pt == 4) attackers |= bishop_attacks(to, occupied) & diagonal;
+        if (pt == 3 || pt == 4) attackers |= rook_attacks(to, occupied) & orthogonal;
+        attackers &= occupied;
+
+        // A king may only capture onto a square the other side no longer
+        // attacks, and nothing can answer it; either way the exchange ends.
+        if (pt == static_cast<int>(PieceType::King)) {
+            if (!(attackers & pos.occupancy(opposite(side)))) {
+                ++d;
+                gain[d] = on_square - gain[d - 1];
+            }
+            break;
+        }
+
+        ++d;
+        gain[d] = on_square - gain[d - 1];
+        on_square = SEE_VALUE[pt];
+        side = opposite(side);
+    }
+
+    while (d > 0) {
+        gain[d - 1] = -std::max(-gain[d - 1], gain[d]);
+        --d;
+    }
+    return gain[0];
+}
+}  // namespace
+
+bool see_at_least(const Position& pos, Move m, int threshold) {
+    if (m.is_en_passant() || m.promotion() != PieceType::None || is_castling(pos, m))
+        return 0 >= threshold;
+
+    // The exchange wins at most the victim (the other side may decline to
+    // recapture) and at least the victim less the moving piece (we may stop
+    // after one recapture). Most calls are settled by these bounds alone.
+    const Piece victim = pos.piece_at(m.to());
+    const int most = victim == NO_PIECE ? 0 : SEE_VALUE[victim % 6];
+    const int least = most - SEE_VALUE[pos.piece_at(m.from()) % 6];
+    if (most < threshold) return false;
+    if (least >= threshold) return true;
+    return see(pos, m) >= threshold;
+}

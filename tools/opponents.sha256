@@ -1,0 +1,17 @@
+# SHA-256 of downloaded gauntlet opponents (official binaries and source archives)
+956d47a41364563bb398ffe816148d48a39c421a51f32d1844bd8152069fa1c1  engines/reckless-0.5.0.exe
+214bd93c0f2f9efed3bda43b017e50b1f68df4508f19c0b5f08ef0a6d00c3cdd  engines/booot-6.4.exe
+d0de237470fab47397de5d1cb3b79afa10ea59fac9b5574e78d23b2a193cfd34  engines/booot-6.5.exe
+8782d321f0654af52916c148677ef2c2132d84d4a8e3bbe86069b0bb433c9499  engines/akimbo-0.5.0.exe
+c4ec06259c4f642ddc341098ba5fe1b2e1652fb589571788cbf0a2a9392c5675  engines/rubichess-1.6.1.1.exe
+828ef86a176fe4ca6cc6783eef1b4783d2c178ca27b71a498aaa8106cb76d431  engines/rubichess-1.8.exe
+d1017770f90a194116681d0e9d954ee63fc648c6f495cb078f111ee468e2a203  engines/seer-2.0.1.exe
+5845ff68d726c518941ffe2e3b37572308c4f0d1c0c470d49ead7f6aee583692  engines/seer-1.2.1/seer_skylake.exe
+a7110e8bb7b526f7bec925ff1d31ad4f2033c14b3e25ad4bb05b441c9061a2a9  engines/seer-1.2.1/save.bin
+45bc8e4969147db9c2eb533810637994619bff0eacc81ccfd9854394901bcbd0  engines/stockfish-19.exe
+3e1e1f5e339122a9f8bc92ba5f523f090cf374bd8dc10c9041f3fa70544dfb70  tools/opponents/igel-2.3.1.tar.gz
+ba8ae30f21a81acb4b89fae97e85612b939d23cc464a60ed0937fb24c26657ed  tools/opponents/igel-2.6.0.tar.gz
+8dabaf565c5899603f77fdec23287ba93eff8c80de6ba21504a97ac1ff3cdb80  tools/opponents/clover-v2.4.tar.gz
+fa07fa480662a308f1128f880ffa6706bdb63bae9ed4229cb5713c84d1b21f36  tools/opponents/clover-v3.0.tar.gz
+004cc44f893042fe432145b9a730368ff3d4e733d3019d643d0e7a47a0d9c35c  tools/opponents/stash-v34.0.tar.gz
+46b5954f9e4ef5fe13b3338b648d261c93d757890bfed223b39db7d18d9c2f60  tools/opponents/stash-v35.0.tar.gz

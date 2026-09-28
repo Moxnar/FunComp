@@ -1,0 +1,25 @@
+# Build output (CMake build trees)
+/build*/
+
+# Downloaded tools and data: fetch again rather than version them
+/books/
+/tools/fastchess/
+/tools/opponents/
+
+# Engine binaries: each is rebuilt from the commit that produced it
+/engines/
+
+# Match output (PGNs, logs, fastchess state)
+/matches/*
+
+# Generated label data
+*.csv
+*.csv.params
+
+# Backup archives
+*.7z
+*.zip
+
+# SPSA parameter files are inputs, not generated data
+!/tools/spsa/*.csv
+/release/

@@ -1,0 +1,3 @@
+name,value,min,max,c_end,r_end
+SeDoubleMargin,25,0,150,6,0.002
+SeMaxDoubles,6,0,16,1,0.002
