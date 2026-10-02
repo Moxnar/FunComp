@@ -1,5 +1,6 @@
 #include "see.h"
 #include "attacks.h"
+#include "params.h"
 #include <algorithm>
 #include <bit>
 
@@ -19,6 +20,10 @@ bool is_castling(const Position& pos, Move m) {
 int see(const Position& pos, Move m) {
     const int to = m.to();
     const Piece victim = pos.piece_at(to);
+    // Every pawn capture onto the first or last rank promotes (to a queen,
+    // for the recaptures); the promoting side gains the difference.
+    const bool promo_square = params::see_promo && (rank_of(to) == 0 || rank_of(to) == 7);
+    constexpr int QUEEN_GAIN = SEE_VALUE[4] - SEE_VALUE[0];
 
     // gain[d]: material for the side making capture d (the move itself is
     // capture 0), if the exchange stops right after it.
@@ -26,6 +31,11 @@ int see(const Position& pos, Move m) {
     int d = 0;
     gain[0] = victim == NO_PIECE ? 0 : SEE_VALUE[victim % 6];
     int on_square = SEE_VALUE[pos.piece_at(m.from()) % 6];  // piece now standing on `to`
+    if (m.promotion() != PieceType::None) {
+        const int promoted = SEE_VALUE[static_cast<int>(m.promotion())];
+        gain[0] += promoted - SEE_VALUE[0];
+        on_square = promoted;
+    }
 
     Bitboard occupied = pos.occupied() ^ bit(m.from());
     Bitboard attackers = pos.attackers_to(to, occupied) & occupied;
@@ -66,6 +76,10 @@ int see(const Position& pos, Move m) {
         ++d;
         gain[d] = on_square - gain[d - 1];
         on_square = SEE_VALUE[pt];
+        if (pt == 0 && promo_square) {
+            gain[d] += QUEEN_GAIN;
+            on_square = SEE_VALUE[4];
+        }
         side = opposite(side);
     }
 
@@ -78,16 +92,31 @@ int see(const Position& pos, Move m) {
 }  // namespace
 
 bool see_at_least(const Position& pos, Move m, int threshold) {
-    if (m.is_en_passant() || m.promotion() != PieceType::None || is_castling(pos, m))
+    const PieceType promo = m.promotion();
+    if (m.is_en_passant() || is_castling(pos, m) || (promo != PieceType::None && !params::see_promo))
         return 0 >= threshold;
 
-    // The exchange wins at most the victim (the other side may decline to
-    // recapture) and at least the victim less the moving piece (we may stop
-    // after one recapture). Most calls are settled by these bounds alone.
+    // The exchange wins at most the victim, plus what a promotion adds (the
+    // other side may decline to recapture), and at least that less the
+    // piece left on the square (we may stop after one recapture: the other
+    // side's pawns can't capture onto our promotion rank, so its first
+    // recapture never promotes). Most calls are settled by these bounds.
     const Piece victim = pos.piece_at(m.to());
-    const int most = victim == NO_PIECE ? 0 : SEE_VALUE[victim % 6];
-    const int least = most - SEE_VALUE[pos.piece_at(m.from()) % 6];
+    int most = victim == NO_PIECE ? 0 : SEE_VALUE[victim % 6];
+    int on_square = SEE_VALUE[pos.piece_at(m.from()) % 6];
+    if (promo != PieceType::None) {
+        most += SEE_VALUE[static_cast<int>(promo)] - SEE_VALUE[0];
+        on_square = SEE_VALUE[static_cast<int>(promo)];
+    }
+    const int least = most - on_square;
     if (most < threshold) return false;
     if (least >= threshold) return true;
     return see(pos, m) >= threshold;
+}
+
+int see_value(const Position& pos, Move m) {
+    if (m.is_en_passant() || is_castling(pos, m) ||
+        (m.promotion() != PieceType::None && !params::see_promo))
+        return 0;
+    return see(pos, m);
 }

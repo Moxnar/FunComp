@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(chess_engine VERSION 1.0 LANGUAGES CXX)
+project(chess_engine VERSION 2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,6 +41,10 @@ endif()
 # -DTUNE=ON advertises the search parameters in params.h as UCI options,
 # for automated tuning (SPSA). Normal builds leave them out of the GUI.
 option(TUNE "Expose search parameters as UCI options" OFF)
+# Continuation logging (cont_log.h, the genconlog command): compiled in only
+# with CONT_LOG, since even switched off its hooks cost the search about 2%
+# nps.
+option(CONT_LOG "Compile in continuation logging (genconlog)" OFF)
 
 function(engine_warnings target)
     if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -57,8 +61,24 @@ function(engine_warnings target)
         # the search thread included, instead of MinGW's 2 MB: deep
         # searches recurse far, singular-extension probes on top.
         target_link_options(${target} PRIVATE -Wl,--stack,16777216)
+    elseif (MSVC AND type STREQUAL "EXECUTABLE")
+        # The same for MSVC (default 1 MB). POSIX builds size the search
+        # thread's stack when they create it (Worker in uci.cpp).
+        target_link_options(${target} PRIVATE /STACK:16777216)
     endif()
 endfunction()
+
+# Fathom (MIT licence, third_party/fathom/LICENSE): Syzygy tablebase
+# probing, unmodified from github.com/jdart1/Fathom at commit c9c6fef
+# (2025-12-24), built with its own settings. Its headers are system
+# headers to the engine, so our warnings skip them. It locks with pthreads
+# outside Windows.
+find_package(Threads REQUIRED)
+add_library(fathom STATIC third_party/fathom/tbprobe.c)
+target_include_directories(fathom SYSTEM PUBLIC third_party/fathom)
+target_compile_definitions(fathom PUBLIC TB_NO_HELPER_API)
+target_link_libraries(fathom PUBLIC Threads::Threads)
+set_target_properties(fathom PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 
 # Everything but the UCI front end, shared by the engine and the tests.
 add_library(engine STATIC
@@ -66,20 +86,39 @@ add_library(engine STATIC
     src/attacks.cpp
     src/movegen.cpp
     src/eval.cpp
+    src/initiative.cpp
     src/see.cpp
     src/pruning.cpp
     src/search.cpp
+    src/tablebase.cpp
+    src/threads.cpp
     src/guide_features.cpp
     src/labels.cpp
+    src/bingo.cpp
+    src/cont_log.cpp
     src/perft.cpp
+    src/pgn.cpp
 )
 target_include_directories(engine PUBLIC src)
+target_link_libraries(engine PUBLIC fathom)
 engine_warnings(engine)
+# The source tree's git commit, for data files to record what made them
+# (labels' .params): regenerated at every build, rewritten only on change.
+add_custom_target(git_hash ALL
+    COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/generated/git_hash.h
+            -P ${CMAKE_SOURCE_DIR}/cmake/git_hash.cmake
+    BYPRODUCTS ${CMAKE_BINARY_DIR}/generated/git_hash.h)
+add_dependencies(engine git_hash)
+target_include_directories(engine PRIVATE ${CMAKE_BINARY_DIR}/generated)
+if (CONT_LOG)
+    target_compile_definitions(engine PUBLIC CONT_LOG)
+endif()
 
 add_executable(chess
     src/main.cpp
     src/uci.cpp
     src/bench.cpp
+    src/telemetry.cpp
 )
 target_link_libraries(chess PRIVATE engine)
 if (TUNE)
@@ -98,3 +137,9 @@ add_executable(search_tests tests/search_tests.cpp)
 target_link_libraries(search_tests PRIVATE engine)
 engine_warnings(search_tests)
 add_test(NAME search COMMAND search_tests)
+# A directory with the 3-4-5-piece Syzygy tables turns on the tablebase
+# tests that need them (about 1 GB, so not required).
+set(SYZYGY_PATH "" CACHE PATH "Syzygy tables for the tests (optional)")
+if (SYZYGY_PATH)
+    set_tests_properties(search PROPERTIES ENVIRONMENT "FUNCOMP_SYZYGY=${SYZYGY_PATH}")
+endif()

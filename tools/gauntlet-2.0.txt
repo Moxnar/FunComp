@@ -1,0 +1,24 @@
+engines\stash-27.0.exe=3049
+engines\stash-29.0.exe=3128
+engines\stash-33.0.exe=3273
+engines\stash-34.0.exe=3315
+engines\stash-35.0.exe=3345
+engines\booot-6.4.exe=3309
+engines\booot-6.5.exe=3333
+engines\reckless-0.5.0.exe=3233
+engines\akimbo-0.5.0.exe=3051
+engines\rubichess-1.6.1.1.exe=3215
+engines\rubichess-1.8.exe=3266
+engines\seer-2.0.1.exe=3186
+engines\igel-2.3.1.exe=3089
+engines\igel-2.6.0.exe=3168
+engines\clover-2.4.exe=3262
+engines\clover-3.0.exe=3338
+engines\stash-36.0.exe=3374
+engines\stash-37.0.exe=3419
+engines\booot-7.0\booot7.exe=3419;name=booot-7.0;dir=C:\FunComp\chess_engine\engines\booot-7.0
+engines\reckless-0.6.0.exe=3377
+engines\rubichess-1.9\RubiChess-1.9-AVX2.exe=3359;name=rubichess-1.9;option.Use NNUE=true;option.NNUENetpath=C:/FunComp/chess_engine/engines/rubichess-1.9/nn-803c91ad5c-20201107.nnue
+engines\seer-2.3.0.exe=3387
+engines\igel-2.9.0.exe=3375
+engines\clover-3.1.exe=3397

@@ -13,6 +13,10 @@
 inline constexpr int SEE_VALUE[6] = {100, 320, 330, 500, 900, 0};
 
 // True if the exchange started by `m` wins at least `threshold`
-// centipawns for the side making it. Castling, en passant and promotions
-// are treated as winning exactly 0.
+// centipawns for the side making it. Castling and en passant are treated
+// as winning exactly 0; promotions too unless params::see_promo is set.
 bool see_at_least(const Position& pos, Move m, int threshold);
+
+// The exchange's value itself (for logging): what see_at_least compares
+// with its threshold, with the same special cases scoring 0.
+int see_value(const Position& pos, Move m);

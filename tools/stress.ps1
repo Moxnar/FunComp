@@ -25,7 +25,12 @@ param(
     [string] $TC = '1+0.01',
     [int] $Games = 2000,
     [int] $Hash = 16,
-    [int] $Concurrency = 24
+    [int] $Concurrency = 24,
+    # More engine options for both sides, as Name=Value strings (call the
+    # script with & from PowerShell so the array survives), e.g.
+    # @('Threads=4', 'SyzygyPath=C:/syzygy'): with threads, lower
+    # -Concurrency so that games x threads fits the machine.
+    [string[]] $Options = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,7 +44,7 @@ $log = [IO.Path]::ChangeExtension($Pgn, '.log')
 $fcArgs = @(
     '-engine', "cmd=$enginePath", 'name=a',
     '-engine', "cmd=$enginePath", 'name=b',
-    '-each', "tc=$TC", "option.Hash=$Hash",
+    '-each', "tc=$TC", "option.Hash=$Hash") + @($Options | ForEach-Object { "option.$_" }) + @(
     '-openings', "file=$((Resolve-Path $Book).Path)", "format=$format", 'order=random',
     '-rounds', [Math]::Max(1, [int]($Games / 2)), '-games', 2, '-repeat',
     '-concurrency', $Concurrency,

@@ -57,3 +57,20 @@ inline Bitboard queen_attacks(int square, Bitboard occupied) {
 
 inline Bitboard squares_between(int a, int b) { return attack_tables::between[a][b]; }
 inline Bitboard line_through(int a, int b) { return attack_tables::line[a][b]; }
+
+// Set-wise pawn helpers for evaluation terms (move generation keeps its
+// own, specialised by colour at compile time).
+inline constexpr Bitboard FILE_A_BB = 0x0101010101010101ULL;
+inline constexpr Bitboard FILE_H_BB = FILE_A_BB << 7;
+inline constexpr Bitboard RANK_BB[8] = {0xFFULL,       0xFFULL << 8,  0xFFULL << 16, 0xFFULL << 24,
+                                        0xFFULL << 32, 0xFFULL << 40, 0xFFULL << 48, 0xFFULL << 56};
+
+// One step toward the opponent's side.
+inline constexpr Bitboard pawn_push_set(Color c, Bitboard b) {
+    return c == Color::White ? b << 8 : b >> 8;
+}
+// Every square a set of `c`'s pawns attacks.
+inline constexpr Bitboard pawn_attack_set(Color c, Bitboard pawns) {
+    return c == Color::White ? ((pawns & ~FILE_A_BB) << 7) | ((pawns & ~FILE_H_BB) << 9)
+                             : ((pawns & ~FILE_A_BB) >> 9) | ((pawns & ~FILE_H_BB) >> 7);
+}

@@ -365,7 +365,7 @@ Bitboard Position::compute_checkers() const {
            color_bb_[static_cast<int>(opposite(side_))];
 }
 
-void Position::make_move(Move move, StateInfo& st) {
+void Position::apply_move(Move move, StateInfo& st) {
     st.key = key_;
     st.pawn_key = pawn_key_;
     st.nonpawn_key[0] = nonpawn_key_[0];
@@ -452,7 +452,6 @@ void Position::make_move(Move move, StateInfo& st) {
     key_ ^= zobrist_side;
     side_ = them;
     if (us == Color::Black) ++fullmove_;
-    checkers_ = compute_checkers();
 }
 
 void Position::unmake_move(Move move, const StateInfo& st) {

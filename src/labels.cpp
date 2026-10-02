@@ -1,4 +1,5 @@
 #include "labels.h"
+#include "git_hash.h"
 #include "guide_features.h"
 #include "movegen.h"
 #include "params.h"
@@ -27,6 +28,15 @@ const char* node_name(prune::NodeType n) {
         case prune::NodeType::PV: return "pv";
         case prune::NodeType::Cut: return "cut";
         default: return "all";
+    }
+}
+
+const char* bound_name(int b) {
+    switch (b) {
+        case TranspositionTable::UPPER: return "upper";
+        case TranspositionTable::LOWER: return "lower";
+        case TranspositionTable::EXACT: return "exact";
+        default: return "none";
     }
 }
 
@@ -65,11 +75,12 @@ bool threefold(const Position& pos, const std::vector<std::uint64_t>& history) {
 void write_params(const LabelOptions& opt) {
     std::ofstream out(opt.out + ".params");
     out << "# genlabels options\n"
+        << "git=" << GIT_HASH << '\n'
         << "in=" << opt.in << "\ngames=" << opt.games << "\nrandomplies=" << opt.random_plies
         << "\ndepth=" << opt.depth << "\nsample=" << opt.sample_rate
         << "\ndepthscale=" << opt.depth_scale << "\nmaxdepth=" << opt.max_label_depth
         << "\nseed=" << opt.seed << "\nhash=" << opt.hash_mb << "\nlabelhash=" << opt.label_hash_mb
-        << "\n# search parameters\n";
+        << "\nlabelnodes=" << opt.label_node_cap << "\n# search parameters\n";
     for (const auto& t : params::tunables()) out << t.name << '=' << *t.value << '\n';
 }
 
@@ -80,10 +91,13 @@ std::string label_header() {
         "fen,depth,ply,static_eval,correction,search_eval,alpha,beta,improving,node,under_null,iir,"
         "score,mate";
     for (const char* name : features::NAMES) (h += ',') += name;
+    h += ",group,rate,tt_hit,tt_depth,tt_bound,tree_nodes,reached_moves,fresh_nodes,censored,"
+         "fresh_curve,score_curve";
     return h;
 }
 
-std::string label_row(Searcher& labeller, const LabelSample& s) {
+std::string label_row(Searcher& labeller, const LabelSample& s, std::uint64_t group,
+                      std::uint64_t rate, std::uint64_t node_cap) {
     Position pos;
     if (!pos.set_fen(s.fen) || pos.in_check(pos.side_to_move())) return {};
 
@@ -93,7 +107,12 @@ std::string label_row(Searcher& labeller, const LabelSample& s) {
     labeller.new_game();
     SearchLimits limits;
     limits.depth = s.depth;
+    limits.nodes = node_cap;
     labeller.search(pos, limits, {}, false);
+    const auto& iters = labeller.iterations();
+    // Stopped by the cap (a mate or stalemate at the root has no iterations
+    // and isn't).
+    const bool censored = node_cap && labeller.nodes() >= node_cap;
     const int raw = labeller.last_score();
     const bool mate = std::abs(raw) > Searcher::MATE_BOUND;
     const int score = std::clamp(raw, -LABEL_SCORE_CLIP, LABEL_SCORE_CLIP);
@@ -104,6 +123,14 @@ std::string label_row(Searcher& labeller, const LabelSample& s) {
         << node_name(s.node) << ',' << s.under_null << ',' << s.iir << ',' << score << ','
         << mate;
     for (const float f : features::extract(pos)) row << ',' << f;
+
+    row << ',' << group << ',' << rate << ',' << s.tt_hit << ',' << s.tt_depth << ','
+        << bound_name(s.tt_bound) << ',' << s.tree_nodes << ',' << s.reached_moves << ','
+        << labeller.nodes() << ',' << censored << ',';
+    for (std::size_t i = 0; i < iters.size(); ++i) row << (i ? ";" : "") << iters[i].nodes;
+    row << ',';
+    for (std::size_t i = 0; i < iters.size(); ++i)
+        row << (i ? ";" : "") << std::clamp(iters[i].score, -LABEL_SCORE_CLIP, LABEL_SCORE_CLIP);
     return row.str();
 }
 
@@ -123,6 +150,7 @@ std::uint64_t generate_labels(const LabelOptions& opt, std::ostream& log) {
     std::vector<LabelSample> samples;
     std::uint64_t rng = opt.seed;
     std::uint64_t written = 0;
+    std::uint64_t group = 0;  // games or input lines so far; see labels.h
     const auto done = [&] { return opt.count && written >= opt.count; };
 
     SearchLimits limits;
@@ -136,7 +164,9 @@ std::uint64_t generate_labels(const LabelOptions& opt, std::ostream& log) {
         driver.set_label_sampling(nullptr, {}, 0);
         for (const LabelSample& s : samples) {
             if (done()) break;
-            const std::string row = label_row(labeller, s);
+            const std::string row = label_row(labeller, s, group,
+                                              rates[static_cast<std::size_t>(s.depth)],
+                                              opt.label_node_cap);
             if (row.empty()) continue;
             out << row << '\n';
             ++written;
@@ -157,6 +187,7 @@ std::uint64_t generate_labels(const LabelOptions& opt, std::ostream& log) {
             Position pos;
             if (!parse_fen_line(line, fen) || !pos.set_fen(fen)) continue;
             drive(pos, {});
+            ++group;
             if (++n % 100 == 0)
                 log << "info string genlabels: " << n << " positions, " << written << " rows"
                     << std::endl;
@@ -191,6 +222,7 @@ std::uint64_t generate_labels(const LabelOptions& opt, std::ostream& log) {
                 play(best);
                 if (pos.halfmove_clock() >= 100 || threefold(pos, history)) break;
             }
+            ++group;
             log << "info string genlabels: game " << g + 1 << '/' << opt.games << ", " << written
                 << " rows" << std::endl;
         }

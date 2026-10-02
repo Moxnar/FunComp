@@ -1,0 +1,14 @@
+TmMovesToGo=25
+TmIncPct=76
+TmHardPct=305
+TmHardCapPct=51
+TmSoftPct=64
+TmStableStart=158
+TmStableStep=14
+TmStableMin=79
+TmDropScale=47
+TmDropMax=56
+TmNodesBase=251
+TmNodesSlope=151
+TmNodesMin=65
+TmNodesMinDepth=7

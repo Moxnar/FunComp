@@ -38,12 +38,48 @@ enum Heuristic : int {
     QsDelta,     // delta pruning in quiescence
     QsEvasion,   // quiet evasions in quiescence, once one was searched
     AlphaTtCut,  // a shallower hash upper bound well below alpha: fail low
+    Underpromo,  // underpromotions (knight ones that give check are kept)
+    LmrCapture,  // LMR of a losing capture (LmrCaptures); also counted under LMR
     COUNT
 };
 
 inline constexpr const char* NAMES[COUNT] = {
     "rfp", "razor", "nullmove", "lmp", "futility", "see-quiet", "see-capture", "lmr", "qs-see",
-    "probcut", "history", "qs-delta", "qs-evasion", "alpha-tt",
+    "probcut", "history", "qs-delta", "qs-evasion", "alpha-tt", "underpromo", "lmr-capture",
+};
+
+// Search features that aren't pruning decisions, counted the same way
+// (considered, acted) so that a switch test can say how often its feature
+// does anything. No verification: there is nothing skipped to check.
+enum Feature {
+    RepInReach,    // upcoming repetition raised alpha to the draw score
+    Singular,      // singular-extension probes; acted: the hash move extended
+    DoubleExt,     // of the probes, a double extension
+    NegativeExt,   // of the probes, a negative extension
+    MultiCut,      // of the probes, a cutoff (the probe beat beta)
+    IIR,           // internal iterative reduction, at nodes deep enough
+    CheckExt,      // checking moves; acted: extended
+    LmrDeeper,     // re-searches after a reduced fail high; acted: a ply deeper
+    LmrShallower,  // the same; acted: a ply shallower
+    PriorCm,       // nodes failing low; acted: the prior-countermove bonus given
+    TtPvInherit,   // fail-lows under a flagged parent; acted: the flag inherited
+    FiftyKey,      // main-search hash probes; acted: under a clock bucket's own key
+    TmNodes,       // soft-limit checks scaled by node share; acted: it changed the stop
+    QuietCheck,    // quiet moves searched; acted: a direct check, with the ordering bonus
+    FailFirm,      // non-root fail highs (RFP, stand pat, ProbCut, main); acted: pulled toward beta
+    EvalHist,      // eval-change history updates (only counted when on); acted: nonzero
+    LmrParentHist, // reduced quiet moves after a quiet one; acted: histories of opposite sign
+    FEATURE_COUNT
+};
+
+inline constexpr const char* FEATURE_NAMES[FEATURE_COUNT] = {
+    "rep-in-reach", "singular", "double-ext", "negative-ext", "multi-cut", "iir",
+    "check-ext", "lmr-deeper", "lmr-shallower", "prior-cm", "ttpv-inherit", "fifty-key",
+    "tm-nodes",
+    "quiet-check",
+    "fail-firm",
+    "eval-hist",
+    "lmr-parent-hist",
 };
 
 struct Context {
@@ -61,6 +97,10 @@ struct Context {
     NodeType node = NodeType::All;
     bool tt_pv = false;    // on the PV now, or when its hash entry was stored
     bool tt_capture = false;  // the hash move is a capture
+    // The opponent's move that led here was quiet, and its quiet history
+    // when it was chosen (see params::lmr_parent_hist).
+    bool parent_quiet = false;
+    int parent_history = 0;
 
     // Move (move-level heuristics only).
     Move move{};
@@ -146,9 +186,16 @@ inline int razor_margin(const Context& c) {
 
 // Depth reduction R for the null-move search (searched at depth - 1 - R).
 inline int nmp_reduction(const Context& c) {
-    // In 1/1024 ply (see params.h), each term still rounded down to whole
-    // plies as before fractions.
+    // In 1/1024 ply (see params.h): rounded down to whole plies once, at the
+    // end (nmp_round_once), or each term on its own as before fractions.
     constexpr int scale = 1024;
+    if (params::nmp_round_once) {
+        const int depth_term = c.depth * params::nmp_depth_mult;
+        // In 64 bits: a large eval would overflow the product.
+        const int eval_term = static_cast<int>(std::min<long long>(
+            1LL * (c.static_eval - c.beta) * params::nmp_eval_mult * scale / 100000, params::nmp_eval_max));
+        return detail::guided_reduction(NullMove, c, (params::nmp_base + depth_term + eval_term) / scale);
+    }
     const int depth_term = c.depth * params::nmp_depth_mult / scale * scale;
     const int eval_term = (c.static_eval - c.beta) * params::nmp_eval_mult / 100000 * scale;
     const int r = params::nmp_base + depth_term + std::min(eval_term, params::nmp_eval_max);
@@ -208,6 +255,13 @@ inline int lmr_reduction(const Context& c) {
     if (c.tt_capture) r += params::lmr_tt_capture;
     if (!c.quiet) r += params::lmr_bad_capture;  // a losing capture (see LmrCaptures)
     r -= static_cast<int>(static_cast<long long>(c.history) * params::lmr_hist_mult / 65536);
+    // Our move's history against the opponent's: a well-regarded reply to a
+    // poorly regarded move is likely the refutation, reduced less; a poorly
+    // regarded reply to a well-regarded move, more. Zero (untried) is neutral.
+    if (params::lmr_parent_hist && c.quiet && c.parent_quiet) {
+        if (c.history > 0 && c.parent_history < 0) r -= params::lmr_parent_hist;
+        else if (c.history < 0 && c.parent_history > 0) r += params::lmr_parent_hist;
+    }
     if (c.threatened)
         r += c.evades_threat ? -params::lmr_threat_evade : params::lmr_threat_ignore;
     if (c.escapes_threat) r -= params::lmr_static_threat;
@@ -228,11 +282,19 @@ struct Stats {
         std::uint64_t tried = 0, fired = 0, verified = 0, wrong = 0;
     };
     std::array<Counter, COUNT> c{};
+    std::array<Counter, FEATURE_COUNT> f{};  // tried and fired only
     std::uint64_t lmr_researches = 0;
+    std::uint64_t lmr_capture_researches = 0;
 
     void clear() { *this = Stats{}; }
     // One "info string" line per heuristic, as a table.
     void print(std::ostream& out) const;
+    // Adds another set of counters (another thread's, another process's).
+    void add(const Stats& o);
+    // The raw counters, one "name tried fired verified wrong" line each
+    // (features: "name considered acted 0 0"), for summing across files
+    // (tools/telemetry-sum.sh).
+    void write(std::ostream& out) const;
 };
 
 }  // namespace prune

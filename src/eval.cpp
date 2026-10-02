@@ -1,6 +1,11 @@
 #include "eval.h"
+#include "initiative.h"
+#include "params.h"
+#include "see.h"
+#include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 
 namespace {
 // Tables are laid out as printed on the CPW page: first row is rank 8,
@@ -157,6 +162,78 @@ constexpr Tables make_tables() {
     return t;
 }
 constexpr Tables TABLES = make_tables();
+
+// King moves between two squares.
+int king_distance(int a, int b) {
+    return std::max(std::abs(file_of(a) - file_of(b)), std::abs(rank_of(a) - rank_of(b)));
+}
+
+// Mop-up: against a bare king, the side with mating material is rewarded
+// for driving that king to the edge and bringing its own king closer. The
+// piece-square tables do this too weakly for fast games to convert: the
+// mate sits beyond the horizon, and each drawing move scores the same, so
+// at 1+0.01 queen against king was drawn by the fifty-move rule. With a
+// bishop and a knight, the target is a corner of the bishop's colour,
+// where the mate is. (A first version fired whenever the weaker side had
+// no pawns, pieces or not, and lost 7.6 Elo.)
+int mop_up(const Position& pos) {
+    if (!params::mop_edge && !params::mop_kings) return 0;
+    for (int strong = 0; strong < 2; ++strong) {
+        const Color weak = static_cast<Color>(strong ^ 1);
+        if (std::popcount(pos.occupancy(weak)) != 1) continue;  // a bare king
+
+        const int base = strong == 0 ? WP : BP;
+        const Bitboard knights = pos.pieces(static_cast<Piece>(base + 1));
+        const Bitboard bishops = pos.pieces(static_cast<Piece>(base + 2));
+        const bool majors = pos.pieces(static_cast<Piece>(base + 3)) | pos.pieces(static_cast<Piece>(base + 4));
+        // Mating material: a queen or rook, or a bishop with another minor.
+        if (!majors && !(bishops && std::popcount(knights | bishops) >= 2)) continue;
+
+        const int wk = std::countr_zero(pos.pieces(static_cast<Piece>((strong ^ 1) == 0 ? WK : BK)));
+        const int sk = std::countr_zero(pos.pieces(static_cast<Piece>(base + 5)));
+        int edge;
+        if (!majors && !pos.pieces(static_cast<Piece>(base)) && std::popcount(bishops) == 1 &&
+            std::popcount(knights) == 1) {
+            // Bishop and knight: the corners of the bishop's colour (a1 is dark).
+            const int b = std::countr_zero(bishops);
+            const bool light = (file_of(b) + rank_of(b)) % 2 == 1;
+            const int d = light ? std::min(king_distance(wk, 7), king_distance(wk, 56))
+                                : std::min(king_distance(wk, 0), king_distance(wk, 63));
+            edge = 7 - d;
+        } else {
+            // Distance from the centre: 0 on d4-e5, 6 in a corner.
+            edge = 3 - std::min(file_of(wk), 7 - file_of(wk)) + 3 - std::min(rank_of(wk), 7 - rank_of(wk));
+        }
+        const int bonus = params::mop_edge * edge + params::mop_kings * (7 - king_distance(wk, sk));
+        return static_cast<int>(pos.side_to_move()) == strong ? bonus : -bonus;
+    }
+    return 0;
+}
+
+// Drawishness (params::draw_ocb_pct): the percent of the eval to keep in
+// endings where an edge rarely converts; 100 elsewhere.
+int drawish_pct(const Position& pos) {
+    if (params::draw_ocb_pct == 100 && params::draw_pawnless_pct == 100) return 100;
+    int count[2][6];
+    int material[2] = {0, 0};
+    for (int c = 0; c < 2; ++c)
+        for (int pt = 0; pt < 5; ++pt) {
+            count[c][pt] = std::popcount(pos.pieces(static_cast<Piece>(c * 6 + pt)));
+            material[c] += count[c][pt] * SEE_VALUE[pt];
+        }
+    const int pawns = count[0][0] + count[1][0];
+    if (pawns == 0 && std::abs(material[0] - material[1]) < params::draw_pawnless_margin)
+        return params::draw_pawnless_pct;
+    // Opposite-coloured bishops and nothing else but pawns.
+    bool ocb = true;
+    for (int c = 0; c < 2; ++c)
+        ocb = ocb && count[c][1] == 0 && count[c][2] == 1 && count[c][3] == 0 && count[c][4] == 0;
+    if (ocb) {
+        const int w = std::countr_zero(pos.pieces(WB)), b = std::countr_zero(pos.pieces(BB));
+        if ((file_of(w) + rank_of(w) + file_of(b) + rank_of(b)) % 2 == 1) return params::draw_ocb_pct;
+    }
+    return 100;
+}
 }
 
 Evaluator::Accumulator Evaluator::compute(const Position& pos) {
@@ -209,12 +286,18 @@ void Evaluator::push(const DirtyPieces& dirty) {
 }
 
 int Evaluator::evaluate(const Position& pos) const {
-    // The combining point for evaluation terms. Today it is the PeSTO
-    // score alone; hand-written adjustments and a network term will be
-    // added here.
-    return score(stack_[static_cast<std::size_t>(top_)], pos.side_to_move());
+    // The combining point for evaluation terms: the PeSTO score, the
+    // mop-up term and the initiative term, scaled toward a draw in drawish
+    // endings; a network term will be added here.
+    const int v = score(stack_[static_cast<std::size_t>(top_)], pos.side_to_move()) +
+                  mop_up(pos) + initiative::evaluate(pos);
+    const int pct = drawish_pct(pos);
+    return pct == 100 ? v : v * pct / 100;
 }
 
 int evaluate(const Position& pos) {
-    return Evaluator::score(Evaluator::compute(pos), pos.side_to_move());
+    const int v = Evaluator::score(Evaluator::compute(pos), pos.side_to_move()) + mop_up(pos) +
+                  initiative::evaluate(pos);
+    const int pct = drawish_pct(pos);
+    return pct == 100 ? v : v * pct / 100;
 }

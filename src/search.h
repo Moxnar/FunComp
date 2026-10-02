@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,11 +21,21 @@ struct SearchLimits {
     int movestogo = 0;
     std::uint64_t nodes = 0; // 0 = no node limit
     bool infinite = false;
+    // "go ponder": the position after the move we expect the opponent to
+    // play. Searched without limits until "ponderhit" (then the clock
+    // limits above apply, from that moment) or "stop".
+    bool ponder = false;
 };
 
-// Transposition table shared by all searches of a game. Entries store the
-// best move found, a score that is exact or a bound on the true score, and
-// the node's static evaluation so it needn't be recomputed on a revisit.
+// The key the hash table keeps `pos` under: its Zobrist key with the
+// halfmove clock's bucket mixed in (params::fifty_hash_width; the key
+// itself while that is 0). Repetition detection uses pos.key().
+std::uint64_t tt_key(const Position& pos);
+
+// Transposition table shared by all searches of a game, and by all search
+// threads. Entries store the best move found, a score that is exact or a
+// bound on the true score, and the node's static evaluation so it needn't
+// be recomputed on a revisit.
 //
 // Entries come in clusters of four, one 64-byte cache line: a position can
 // live in any entry of its cluster, so a deep entry and a fresh shallow one
@@ -36,10 +47,16 @@ struct SearchLimits {
 // (params::tt_replace_margin) and the new score isn't exact. Otherwise the
 // entry with the lowest depth - params::tt_age_weight * age (age: searches since it was
 // written) makes room: stale entries first, then shallow ones.
+//
+// Threads read and write entries without locks. An entry is two 64-bit
+// words, each read and written whole: the data, and the key XOR the data.
+// If a read catches an entry half-written by another thread (one word old,
+// one new), the key no longer checks out and the read is a miss.
 class TranspositionTable {
 public:
     enum Bound : std::uint8_t { NONE = 0, UPPER = 1, LOWER = 2, EXACT = 3 };
 
+    // An entry as read from the table: a copy, unpacked.
     struct Entry {
         std::uint64_t key = 0;
         Move move{};
@@ -54,9 +71,6 @@ public:
     };
 
     static constexpr int CLUSTER_SIZE = 4;
-    struct alignas(64) Cluster {
-        Entry entry[CLUSTER_SIZE];
-    };
 
     explicit TranspositionTable(std::size_t megabytes = 64) { resize(megabytes); }
     void resize(std::size_t megabytes);
@@ -71,21 +85,72 @@ public:
     // so the memory access overlaps with other work before the probe.
     void prefetch(std::uint64_t key) const { __builtin_prefetch(&clusters_[key & mask_]); }
 
-    const Entry* probe(std::uint64_t key) const {
-        for (const Entry& e : clusters_[key & mask_].entry)
-            if (e.key == key && e.bound() != NONE) return &e;
-        return nullptr;
+    // Copies the position's entry into `out`, if the table has one.
+    bool probe(std::uint64_t key, Entry& out) const {
+        // The key is checked on the raw words; only a hit is unpacked.
+        for (const Slot& s : clusters_[key & mask_].slot) {
+            const std::uint64_t d = s.data.load(std::memory_order_relaxed);
+            if ((s.check.load(std::memory_order_relaxed) ^ d) == key && (d >> 56 & 3) != NONE) {
+                out = Slot::unpack(key, d);
+                return true;
+            }
+        }
+        return false;
     }
     void store(std::uint64_t key, Move move, int score, int eval, int depth, Bound bound,
                bool pv);
 
 private:
-    std::vector<Cluster> clusters_;
+    // An entry as stored: move 16 bits, score 16, eval 16, depth 8 and
+    // gen_bound 8 in `data`; `check` is the key XOR data. Relaxed atomics:
+    // plain loads and stores on x86, but defined behaviour between threads.
+    struct Slot {
+        std::atomic<std::uint64_t> check{0}, data{0};
+
+        static Entry unpack(std::uint64_t key, std::uint64_t d) {
+            Entry e;
+            e.key = key;
+            e.move.data = static_cast<std::uint16_t>(d);
+            e.score = static_cast<std::int16_t>(d >> 16);
+            e.eval = static_cast<std::int16_t>(d >> 32);
+            e.depth = static_cast<std::int8_t>(d >> 48);
+            e.gen_bound = static_cast<std::uint8_t>(d >> 56);
+            return e;
+        }
+        Entry read() const {
+            const std::uint64_t d = data.load(std::memory_order_relaxed);
+            return unpack(check.load(std::memory_order_relaxed) ^ d, d);
+        }
+        void write(const Entry& e) {
+            const std::uint64_t d =
+                std::uint64_t{e.move.data} |
+                std::uint64_t{static_cast<std::uint16_t>(e.score)} << 16 |
+                std::uint64_t{static_cast<std::uint16_t>(e.eval)} << 32 |
+                std::uint64_t{static_cast<std::uint8_t>(e.depth)} << 48 |
+                std::uint64_t{e.gen_bound} << 56;
+            data.store(d, std::memory_order_relaxed);
+            check.store(e.key ^ d, std::memory_order_relaxed);
+        }
+    };
+    struct alignas(64) Cluster {
+        Slot slot[CLUSTER_SIZE];
+    };
+    static_assert(sizeof(Cluster) == 64);
+
+    std::unique_ptr<Cluster[]> clusters_;
+    std::size_t size_ = 0;  // clusters
     std::size_t mask_ = 0;
     int generation_ = 0;  // 5 bits, wrapping
 };
-static_assert(sizeof(TranspositionTable::Entry) == 16);
-static_assert(sizeof(TranspositionTable::Cluster) == 64);
+
+class ContLog;  // cont_log.h
+// Continuation logging is compiled in only with -DCONT_LOG=ON (CMake).
+#ifdef CONT_LOG
+inline constexpr bool CONT_LOG_BUILD = true;
+#else
+inline constexpr bool CONT_LOG_BUILD = false;
+#endif
+struct ContNode;
 
 // A node picked for label logging: the position, and what the search knew
 // about it when it got there. None of the context can be recovered from
@@ -104,6 +169,15 @@ struct LabelSample {
     bool under_null;         // a null move lies between the root and here
     bool iir;                // searched one ply shallower than `depth` (internal
                              // iterative reduction, after node-level pruning)
+    // The hash entry the node found, if any (one that cut it off returned
+    // before sampling): much of why one position costs little in one tree
+    // and a lot in another.
+    bool tt_hit = false;
+    int tt_depth = -1;       // -1 without an entry
+    int tt_bound = 0;        // TT::Bound
+    // Set when the node returns, by whichever path (SubtreeMeter, search.cpp):
+    std::uint64_t tree_nodes = 0;  // its subtree's nodes, itself included
+    bool reached_moves = false;    // got past node-level pruning to the move loop
 };
 
 class Searcher {
@@ -112,24 +186,50 @@ public:
     static constexpr int MATE = 30000;
     static constexpr int MAX_PLY = 128;
     static constexpr int MATE_BOUND = MATE - MAX_PLY;  // scores beyond this are mates
+    // A tablebase win, less the distance from the root: below every mate,
+    // so a mate the search finds still counts for more.
+    static constexpr int TB_WIN = MATE_BOUND - 1;
+    // Scores beyond this are decisive: mates or tablebase wins. Evals stay
+    // inside it.
+    static constexpr int DECISIVE_BOUND = TB_WIN - MAX_PLY;
     static constexpr int NO_EVAL = 32001;              // "no static eval" (in check)
 
-    explicit Searcher(std::size_t hash_mb = 64) : tt_(hash_mb) {}
+    // With its own hash table.
+    explicit Searcher(std::size_t hash_mb = 64)
+        : own_tt_(std::make_unique<TranspositionTable>(hash_mb)), tt_(*own_tt_) {}
+    // Sharing `tt` with other searchers: one per thread of a parallel search
+    // (see threads.h).
+    explicit Searcher(TranspositionTable& tt) : tt_(tt) {}
 
     void resize_hash(std::size_t megabytes) { tt_.resize(megabytes); }
+    // Clears the hash table and everything learned (histories, corrections).
     void new_game();
+    // Clears what this searcher learned, but not the hash table.
+    void clear_history();
 
-    // Iterative-deepening search. `history` holds the Zobrist keys of every
-    // position of the game before `pos` (oldest first), for repetition
-    // detection. With `verbose`, prints UCI "info" lines per iteration.
-    // Returns Move{} only if `pos` has no legal moves.
     // For tests: every move the move picker hands out at the root of `pos`,
     // in order, given a hash move and two killers (any of which may be
     // illegal, as a hash collision could supply, or Move{}).
     std::vector<Move> picker_order(const Position& pos, Move tt_move, Move killer1, Move killer2);
 
+    // Iterative-deepening search. `history` holds the Zobrist keys of every
+    // position of the game before `pos` (oldest first), for repetition
+    // detection. With `verbose`, prints UCI "info" lines per iteration.
+    // Returns Move{} only if `pos` has no legal moves.
     Move search(Position& pos, const SearchLimits& limits,
                 const std::vector<std::uint64_t>& history, bool verbose = true);
+
+    // Parallel search (threads.h). The main searcher starts each search
+    // with begin_search, which search() otherwise does itself: a new hash
+    // table generation and the root's tablebase ranking. Each helper then
+    // takes the root from it (adopt_root) and searches the same position
+    // until stopped, sharing the hash table; the main searcher alone keeps
+    // time and reports, counting the helpers' nodes (set_helpers).
+    // `limits` decide whether there is time to rank a tablebase root by DTZ
+    // (see tm_tb_dtz_min_ms).
+    void begin_search(const Position& pos, const SearchLimits& limits);
+    void adopt_root(const Searcher& main);
+    void set_helpers(std::vector<const Searcher*> helpers) { helpers_ = std::move(helpers); }
 
     // Asks a running search, from another thread, to stop as soon as it
     // can; search() then returns the best move found so far. The request
@@ -140,9 +240,41 @@ public:
     void clear_stop() { stop_request_.store(false, std::memory_order_relaxed); }
     bool stop_requested() const { return stop_request_.load(std::memory_order_relaxed); }
 
+    // Pondering (SearchLimits::ponder): "ponderhit", from another thread,
+    // turns the running search into a timed one. The flag stays set until
+    // clear_ponderhit(), which the caller does before starting a search.
+    void ponderhit() { ponderhit_.store(true, std::memory_order_relaxed); }
+    void clear_ponderhit() { ponderhit_.store(false, std::memory_order_relaxed); }
+    bool ponderhit_received() const { return ponderhit_.load(std::memory_order_relaxed); }
+    // The reply the hash table expects to `best` from `pos` (the position
+    // just searched), for "bestmove ... ponder ..."; Move{} if none.
+    Move ponder_move(Position& pos, Move best);
+
     std::uint64_t nodes() const { return nodes_; }
+    // The last search's completed iterations, in order: depth, nodes searched
+    // by the end of it (from the start of the search), score.
+    struct Iteration {
+        int depth;
+        std::uint64_t nodes;
+        int score;
+    };
+    const std::vector<Iteration>& iterations() const { return iterations_; }
+    // Tablebase probes that found the position, in the last search.
+    std::uint64_t tb_hits() const { return tb_hits_; }
+    // Both counts as last published for other threads to read: at least
+    // every 2048 nodes during a search, and exactly at its end.
+    std::uint64_t published_nodes() const { return published_nodes_.load(std::memory_order_relaxed); }
+    std::uint64_t published_tb_hits() const {
+        return published_tb_hits_.load(std::memory_order_relaxed);
+    }
     // Score of the last completed iteration of the last search.
     int last_score() const { return last_score_; }
+    // For tests: nodes spent under root move `m` in the last search, over
+    // all its iterations, and under all root moves together.
+    std::uint64_t root_move_nodes(Move m) const {
+        return root_move_nodes_[static_cast<std::size_t>(m.from() * 64 + m.to())];
+    }
+    std::uint64_t root_nodes_total() const { return root_nodes_total_; }
 
     // Pruning statistics, accumulated over searches until cleared.
     const prune::Stats& stats() const { return stats_; }
@@ -167,6 +299,10 @@ public:
         rng_ = seed | 1;
     }
 
+    // Continuation logging (cont_log.h): sampled nodes record their moves
+    // and outcomes in `log`; null turns it off.
+    void set_cont_log(ContLog* log) { cont_log_ = log; }
+
 private:
     using Clock = std::chrono::steady_clock;
 
@@ -177,6 +313,7 @@ private:
         Move move{};         // move being searched from this ply
         Piece piece = NO_PIECE;  // the piece making `move`; NO_PIECE for a null move
         bool quiet = false;      // `move` is a quiet move (no capture or promotion)
+        int history = 0;         // quiet_history() of `move` when chosen (0 unless quiet)
         Move killers[2]{};   // quiet moves that recently caused cutoffs here
         bool no_prune = false;  // next entry is a verification re-search: don't prune
         // Set when this node's null move failed low: the opponent's best
@@ -198,6 +335,23 @@ private:
         // was when it was stored (the entry's PV bit). Such nodes are
         // reduced less: they are where the score is decided.
         bool tt_pv = false;
+        // `move`'s position in this node's move order (dropped quiet moves
+        // counted), and whether the child search now running for it is
+        // provisional: a reduced or null-window test that is searched again
+        // if the child fails low. For the prior-countermove bonus.
+        int move_index = 0;
+        bool provisional = false;
+        // The LMR reduction of the child search now running for `move` (0 when
+        // it runs at full depth), for continuation logging: only in CONT_LOG
+        // builds, since even an idle field here costs nps (stack layout).
+#ifdef CONT_LOG
+        int reduction = 0;
+        void set_reduction(int r) { reduction = r; }
+        int logged_reduction() const { return reduction; }
+#else
+        void set_reduction(int) {}
+        int logged_reduction() const { return 0; }
+#endif
     };
 
     // Continuation history: how well a quiet move (by its piece and
@@ -232,7 +386,8 @@ private:
         return piece_to(pos.piece_at(m.from()), m.to()) * 6 + static_cast<std::size_t>(victim % 6);
     }
 
-    TranspositionTable tt_;
+    std::unique_ptr<TranspositionTable> own_tt_;  // none when shared
+    TranspositionTable& tt_;
     Evaluator eval_;
     std::array<StackEntry, MAX_PLY + 1> stack_{};
     // Quiet-move history, [side to move][from][to].
@@ -250,24 +405,80 @@ private:
     std::vector<std::uint64_t> keys_;  // game history + current search path
     std::uint64_t nodes_ = 0;
     std::uint64_t node_limit_ = 0;     // 0 = none
+    std::vector<Iteration> iterations_;  // see iterations()
     bool stopped_ = false;
     std::atomic<bool> stop_request_{false};  // see request_stop()
     Clock::time_point start_;
     long long soft_ms_ = 0, hard_ms_ = 0;  // 0 = unlimited
+    // The soft limit counts from limit_base_ms_ (0, the start, except after
+    // a ponderhit); the hard limit is from the start, being checked often.
+    long long limit_base_ms_ = 0;
+    // While pondering, the time limits wait here for the ponderhit, when
+    // check_ponderhit (on the search thread) applies them, counted from
+    // that moment.
+    std::atomic<bool> ponderhit_{false};
+    bool pondering_ = false;
+    long long ponder_soft_ms_ = 0, ponder_hard_ms_ = 0;
+    void check_ponderhit() {
+        if (pondering_ && ponderhit_received()) {
+            pondering_ = false;
+            limit_base_ms_ = elapsed_ms();
+            soft_ms_ = ponder_soft_ms_;
+            hard_ms_ = limit_base_ms_ + ponder_hard_ms_;
+        }
+    }
     Move root_best_{};
     int root_best_score_ = 0;  // search score of root_best_
     int last_score_ = 0;
     int root_depth_ = 0;  // depth of the current iteration
+    // Nodes spent under each root move (by from and to square) and under all
+    // of them, over the iterations of this search: the time management's
+    // node share (params::tm_nodes_base).
+    std::array<std::uint64_t, 64 * 64> root_move_nodes_{};
+    std::uint64_t root_nodes_total_ = 0;
     int seldepth_ = 0;    // deepest ply reached in it (UCI "seldepth")
     // First index of keys_ after the most recent null move on the search
     // path. Repetitions are only looked for from there on: a position
     // "repeated" across a null move was never reached over the board.
     std::size_t null_barrier_ = 0;
 
+    // Tablebases (see tablebase.h). tb_pieces_: the search probes positions
+    // with at most this many pieces (0: no probing). When the root itself is
+    // in the tables, root_moves_ holds the moves that keep its result, the
+    // only ones searched, and root_tb_score_ what the tables say it is
+    // worth (NO_EVAL otherwise), reported instead of a search score that
+    // isn't a mate.
+    int tb_pieces_ = 0;
+    std::uint64_t tb_hits_ = 0;
+    std::vector<Move> root_moves_;
+    int root_tb_score_ = NO_EVAL;
+    // Ranks the root in the tables and sets the three above.
+    void setup_tablebases(const Position& pos, bool use_dtz);
+    // begin_search (or adopt_root) was done for the coming search.
+    bool root_ready_ = false;
+    std::vector<const Searcher*> helpers_;  // see set_helpers
+    std::atomic<std::uint64_t> published_nodes_{0}, published_tb_hits_{0};
+    void publish_counts() {
+        published_nodes_.store(nodes_, std::memory_order_relaxed);
+        published_tb_hits_.store(tb_hits_, std::memory_order_relaxed);
+    }
+
     prune::Stats stats_;
     std::uint64_t verify_rate_ = 0;  // 0 = no verification
     int verify_depth_ = 0;           // > 0 inside a verification search
     std::vector<LabelSample>* label_sink_ = nullptr;
+    ContNode* open_cont_node();
+    void close_cont_node(ContNode* n, int best, int bound);
+    void drop_cont_nodes(std::size_t keep);
+    [[gnu::noinline]] void log_cont_node(ContNode& cn, const Position& pos, int depth, int ply,
+                                         int node_type, int alpha, int beta, int raw_eval,
+                                         int static_eval, int eval, int corr, bool improving,
+                                         bool in_check, int tt_depth, int tt_bound, int tt_score,
+                                         bool tt_move);
+    [[gnu::noinline]] void log_cont_row(ContNode& cn, const Position& pos, Move m,
+                                        const prune::Context& ctx, int stage, const int* pruned,
+                                        bool skip_quiets, bool any_check, bool hash_move,
+                                        int alpha, int best, int searched, Move threat);
     std::vector<std::uint64_t> label_rates_;  // by depth; see set_label_sampling
     std::uint64_t rng_ = 0x9e3779b97f4a7c15ULL;
 
@@ -283,11 +494,11 @@ private:
                               static_cast<std::size_t>(c)) * CORR_SIZE +
                              (pos.nonpawn_key(c) & (CORR_SIZE - 1))];
     }
-    // The raw static eval plus the corrections for the position's pawns
-    // and, weighted by params::corr_nonpawn_weight, its other pieces.
-    int corrected_eval(const Position& pos, int raw);
-    // The correction corrected_eval() adds (pawn and non-pawn tables), before
+    // The raw static eval plus `corr`, the position's correction(), then
     // fifty-move scaling.
+    int corrected_eval(const Position& pos, int raw, int corr);
+    // The correction for the position's pawns and, weighted by
+    // params::corr_nonpawn_weight, its other pieces.
     int correction(const Position& pos);
     void update_correction(const Position& pos, int depth, int diff);
 
@@ -297,6 +508,11 @@ private:
     bool sample_verify();
     void count_tried(prune::Heuristic h) { if (!verify_depth_) ++stats_.c[h].tried; }
     void count_fired(prune::Heuristic h) { if (!verify_depth_) ++stats_.c[h].fired; }
+    void count_feature(prune::Feature f, bool acted) {
+        if (verify_depth_) return;
+        ++stats_.f[f].tried;
+        stats_.f[f].fired += acted;
+    }
     void record_verified(prune::Heuristic h, bool wrong);
     int verify_node(Position& pos, int depth, int alpha, int beta, int ply, bool cut_node);
     void verify_pruned_move(Position& pos, Move m, prune::Heuristic h, int depth, int alpha,
@@ -327,9 +543,21 @@ private:
     void update_capture_stats(const Position& pos, Move best, const Move* tried, int n_tried,
                               int depth);
     std::vector<Move> principal_variation(Position& pos, int max_len);
+    // The line reported for a root move: `first` (the move this searcher
+    // will play), then the hash moves after it. Not the hash move at the
+    // root itself: with threads, a helper may have stored its own there.
+    std::vector<Move> reported_line(Position& pos, Move first, int max_len);
     // ProbCut's move loop (see negamax): the score of the first good
     // capture that beats pc_beta in a reduced search, and the move in
     // cut_move; below pc_beta if none does.
     int probcut(Position& pos, int depth, int pc_beta, int eval, Move tt_move, int ply,
                 bool cut_node, Move& cut_move);
+
+    // Continuation logging (cont_log.h), last so that it shifts no other
+    // member: the installed log (null = off), and the sampled nodes still
+    // open, innermost last. A node that returns early (time, multi-cut) is
+    // left behind and freed when an ancestor closes or the search ends: no
+    // cleanup on every exit of negamax.
+    ContLog* cont_log_ = nullptr;
+    std::vector<ContNode*> cont_open_;
 };

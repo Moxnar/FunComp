@@ -19,7 +19,9 @@ struct LabelSample;
 // position and depth. One CSV row per node:
 //
 //   fen, depth, ply, static_eval, correction, search_eval, alpha, beta,
-//   improving, node, under_null, iir, score, mate, <guide_features::NAMES...>
+//   improving, node, under_null, iir, score, mate, <guide_features::NAMES...>,
+//   group, rate, tt_hit, tt_depth, tt_bound, tree_nodes, reached_moves,
+//   fresh_nodes, censored, fresh_curve, score_curve
 //
 // All scores are from the side to move's view. static_eval is the node's
 // static eval, correction history included; correction is how much of it
@@ -33,6 +35,30 @@ struct LabelSample;
 // saw; iir is 1 if the node's moves were then searched a ply shallower
 // (internal iterative reduction). score is the depth-d search result,
 // clipped to +-LABEL_SCORE_CLIP, with mate = 1 when it was a mate score.
+//
+// The columns after the features serve the cost head (Try 4's e head).
+// group numbers the self-play game or input line a row came from: its rows
+// are correlated, so split training and
+// validation by group, never by row. rate is the row's 1-in-N sampling
+// rate, to weight rows back to how common their depth is in a real tree.
+// Two costs, answering different questions:
+//
+//   tree_nodes: what the node cost where it stood in the driver's tree
+//     (its window, a warm hash table and histories): every node of its
+//     subtree, node-level pruning and verification searches included.
+//     tt_hit, tt_depth and tt_bound (none, upper, lower, exact) are the hash
+//     entry it found, which explains much of it; reached_moves is 0 when
+//     node-level pruning ended it before the move loop.
+//   fresh_nodes: what depth `depth` costs from a cold start and a full
+//     window: the labelling search's total. fresh_curve has its nodes by
+//     the end of each iteration 1..depth and score_curve each iteration's
+//     score (';'-separated), so one label gives the cost and the score of
+//     every shallower depth too.
+//
+// With a node cap (label_node_cap), a labelling search that reaches it
+// stops early: censored is 1, the curves hold the iterations it finished,
+// score is the last finished iteration's rather than depth `depth`'s, and
+// fresh_nodes is only a lower bound.
 //
 // The labelling search prunes with the current margins, so labels depend
 // on them: each round of retuned margins calls for regenerated data. The
@@ -53,6 +79,7 @@ struct LabelOptions {
     std::uint64_t seed = 1;
     int hash_mb = 16;              // driver searcher
     int label_hash_mb = 2;         // labelling searcher, cleared before every label
+    std::uint64_t label_node_cap = 0;  // per labelling search, 0 = none (see above)
 };
 
 // Returns the number of rows written. Progress and errors go to `log` as
@@ -63,4 +90,7 @@ std::uint64_t generate_labels(const LabelOptions& opt, std::ostream& log);
 // hash table and history are cleared first). Empty if the sample can't be
 // labelled (bad FEN, or in check).
 std::string label_header();
-std::string label_row(Searcher& labeller, const LabelSample& sample);
+// `group` and `rate` fill their columns; `node_cap` limits the labelling
+// search (0: none).
+std::string label_row(Searcher& labeller, const LabelSample& sample, std::uint64_t group = 0,
+                      std::uint64_t rate = 0, std::uint64_t node_cap = 0);

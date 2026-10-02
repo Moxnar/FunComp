@@ -1,16 +1,30 @@
+#include "bingo.h"
+#include "cont_log.h"
 #include "eval.h"
 #include "guide_features.h"
+#include "initiative.h"
 #include "labels.h"
 #include "movegen.h"
+#include "params.h"
+#include "pgn.h"
 #include "position.h"
 #include "search.h"
 #include "see.h"
+#include "tablebase.h"
+#include "threads.h"
 #include <algorithm>
+#include <atomic>
+#include <bit>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -69,6 +83,49 @@ void test_see() {
     // The king may take only if nothing takes it back.
     see_case("king takes undefended", "4k3/8/8/8/8/8/3p4/4K3 w - - 0 1", "e1d2", 100);
     see_case("en passant counts as even", "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", "e5d6", 0);
+    // Promotions gain the new piece less the pawn, and the new piece is
+    // what can be taken back.
+    see_case("safe promotion", "4k3/P7/8/8/8/8/8/4K3 w - - 0 1", "a7a8q", 800);
+    see_case("promotion onto a guarded square", "7r/P3k3/8/8/8/8/8/4K3 w - - 0 1", "a7a8q", -100);
+    see_case("capture-promotion, retaken", "r3k3/1P6/1n6/8/8/8/8/4K3 w - - 0 1", "b7a8q", 400);
+    // Qxb8 Rxb8 axb8=Q: the recapture would lose the rook to a promoting
+    // pawn, so Black declines it (without the promotion: -80).
+    see_case("pawn recapture promotes", "1n5r/P7/4k3/8/8/8/8/1Q2K3 w - - 0 1", "b1b8", 320);
+}
+
+// The mop-up term in `fen` is worth exactly `value` to the side to move.
+void mop_up_case(const char* name, const char* fen, int value) {
+    Position pos;
+    if (!pos.set_fen(fen)) {
+        check(false, std::string(name) + ": bad FEN");
+        return;
+    }
+    const int with = evaluate(pos);
+    const int edge = params::mop_edge, kings = params::mop_kings;
+    params::mop_edge = params::mop_kings = 0;
+    const int without = evaluate(pos);
+    params::mop_edge = edge;
+    params::mop_kings = kings;
+    check(with - without == value,
+          std::string(name) + ": mop-up " + std::to_string(with - without) + ", expected " + std::to_string(value));
+}
+
+void test_mop_up() {
+    // Lone king in the corner, kings 7 apart: the edge term alone.
+    mop_up_case("rook vs cornered king", "k7/8/8/8/8/8/8/R3K3 w - - 0 1", 6 * params::mop_edge);
+    mop_up_case("seen by the defender", "k7/8/8/8/8/8/8/R3K3 b - - 0 1", -6 * params::mop_edge);
+    // King on d5 (a centre square), kings 2 apart: the kings term alone.
+    mop_up_case("kings close", "8/8/8/3k4/8/4K3/8/R7 w - - 0 1", 5 * params::mop_kings);
+    // Bishop and knight: only the corners of the bishop's colour count.
+    mop_up_case("bishop's corner", "7k/8/8/8/8/8/8/1NB1K3 w - - 0 1", 7 * params::mop_edge);
+    mop_up_case("wrong corner", "7k/8/8/8/8/8/8/1N1BK3 w - - 0 1", 0);
+    mop_up_case("knight alone", "k7/8/8/8/8/8/8/N3K3 w - - 0 1", 0);
+    mop_up_case("two knights", "k7/8/8/8/8/8/8/NN2K3 w - - 0 1", 0);
+    // Only against a bare king: a rook left to the defender turns it off.
+    mop_up_case("queen vs rook", "k7/r7/8/8/8/8/8/Q3K3 w - - 0 1", 0);
+    // Pawns on the stronger side are fine.
+    mop_up_case("rook and pawn", "k7/8/8/8/8/8/P7/R3K3 w - - 0 1", 6 * params::mop_edge);
+    mop_up_case("both sides have pawns", "k7/p7/8/8/8/8/P7/R3K3 w - - 0 1", 0);
 }
 
 void test_null_move() {
@@ -115,6 +172,21 @@ void test_mates() {
     mate_case("rook sacrifice", "1r4k1/5ppp/8/8/8/8/3R1PPP/3R2K1 w - - 0 1", "d2d8", 2, 8);
     mate_case("smothered", "r1b3kr/ppp1Bp1p/1b6/n2P4/2p3q1/2Q2N2/P4PPP/RN2R1K1 w - - 1 0",
               "c3h8", 3, 10);
+
+    // Fail-firm returns leave decisive scores alone: the same mates, found
+    // and scored exactly, with every site on.
+    const int rfp = params::ff_rfp_pct, sp = params::ff_stand_pat_pct,
+              pc = params::ff_probcut_pct, md = params::ff_main_depth;
+    params::ff_rfp_pct = params::ff_stand_pat_pct = params::ff_probcut_pct = 50;
+    params::ff_main_depth = 1;
+    mate_case("fail-firm: rook sacrifice", "1r4k1/5ppp/8/8/8/8/3R1PPP/3R2K1 w - - 0 1", "d2d8",
+              2, 8);
+    mate_case("fail-firm: smothered",
+              "r1b3kr/ppp1Bp1p/1b6/n2P4/2p3q1/2Q2N2/P4PPP/RN2R1K1 w - - 1 0", "c3h8", 3, 10);
+    params::ff_rfp_pct = rfp;
+    params::ff_stand_pat_pct = sp;
+    params::ff_probcut_pct = pc;
+    params::ff_main_depth = md;
 }
 
 // The PV printed after the last iteration of a search of `fen` after
@@ -179,6 +251,161 @@ void test_stop_request() {
     limits.depth = 10;
     s.search(pos, limits, {}, false);
     check(s.nodes() > 2048, "stop: cleared, the next search runs");
+}
+
+// PGN reading and SAN: tags, comments, variations, castling both ways,
+// disambiguation, promotion, and a second game in the same file.
+void test_pgn() {
+    std::istringstream in(
+        "[Event \"t\"]\n"
+        "[FEN \"r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1\"]\n"
+        "[Result \"*\"]\n"
+        "\n"
+        "1. O-O {+0.10/10 0.1s} O-O-O 2. Rfd1 (2. Ra2 Kb8) Rhe8 3. Kg2 *\n"
+        "[Event \"t2\"]\n"
+        "[Result \"1/2-1/2\"]\n"
+        "\n"
+        "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Bxc6 dxc6 5. O-O f6 1/2-1/2\n");
+    const std::vector<pgn::Game> games = pgn::read(in);
+    check(games.size() == 2, "pgn: two games");
+    if (games.size() != 2) return;
+    auto replay = [](const pgn::Game& g, Position& pos) {
+        pos.set_fen(g.fen);
+        for (const std::string& san : g.moves) {
+            const Move m = pgn::parse_san(pos, san);
+            if (m == Move{}) return false;
+            StateInfo st;
+            pos.make_move(m, st);
+        }
+        return true;
+    };
+    Position pos;
+    check(games[0].moves.size() == 5 && replay(games[0], pos) &&
+              pos.fen().rfind("2krr3/8/8/8/8/8/6K1/R2R4 b", 0) == 0,
+          "pgn: castling and disambiguation replayed (" + pos.fen() + ")");
+    check(games[1].moves.size() == 10 && games[1].result == "1/2-1/2" && replay(games[1], pos),
+          "pgn: second game from the start position");
+    pos.set_fen("8/P6k/8/8/8/8/8/K7 w - - 0 1");
+    const Move promo = pgn::parse_san(pos, "a8=Q+");
+    check(promo != Move{} && promo.promotion() == PieceType::Queen, "pgn: promotion");
+    check(pgn::parse_san(pos, "Nf3") == Move{}, "pgn: no such move");
+}
+
+// The hash-table key carries the halfmove clock's bucket when
+// FiftyHashWidth is set; the position's own key (repetitions) never does.
+void test_tt_key() {
+    Position a, b, c;
+    a.set_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1");
+    b.set_fen("4k3/8/8/8/8/8/8/R3K3 w - - 50 1");
+    c.set_fen("4k3/8/8/8/8/8/8/R3K3 w - - 55 1");
+    const int start = params::fifty_hash_start, width = params::fifty_hash_width;
+    params::fifty_hash_width = 0;
+    check(tt_key(a) == a.key() && tt_key(b) == b.key(), "tt_key: off, the position's key");
+    params::fifty_hash_start = 10;
+    params::fifty_hash_width = 10;
+    check(a.key() == b.key(), "tt_key: the position's key ignores the clock");
+    check(tt_key(a) == a.key(), "tt_key: below the start, the position's key");
+    check(tt_key(a) != tt_key(b), "tt_key: clock 0 and 50 differ");
+    check(tt_key(b) == tt_key(c), "tt_key: one bucket for 50 and 55");
+    params::fifty_hash_start = start;
+    params::fifty_hash_width = width;
+}
+
+// Time management's node share: the nodes counted under each root move add
+// up to the root total, which is every node but the root visits.
+void test_root_move_nodes() {
+    Position pos;
+    Searcher s(16);
+    SearchLimits limits;
+    limits.depth = 9;
+    s.search(pos, limits, {}, false);
+    MoveList moves;
+    int count = 0;
+    generate_legal(pos, moves, count);
+    std::uint64_t sum = 0;
+    for (int i = 0; i < count; ++i) sum += s.root_move_nodes(moves[static_cast<std::size_t>(i)]);
+    check(sum == s.root_nodes_total(), "root nodes: the moves add up to the total");
+    check(s.root_nodes_total() < s.nodes() && s.root_nodes_total() + 100 > s.nodes(),
+          "root nodes: all nodes but the root visits (" + std::to_string(s.root_nodes_total()) +
+              " of " + std::to_string(s.nodes()) + ")");
+}
+
+// Lazy SMP: helpers search alongside the main searcher and stop with it;
+// with one thread the pool is the plain search (same nodes as a Searcher).
+void test_thread_pool() {
+    Position pos;
+    SearchLimits limits;
+    limits.depth = 10;
+    ThreadPool pool(16);
+    Searcher alone(16);
+    pool.search(pos, limits, {}, false);
+    alone.search(pos, limits, {}, false);
+    check(pool.main().nodes() == alone.nodes(), "threads: one thread searches as a Searcher");
+
+    pool.set_threads(4);
+    pool.new_game();
+    for (int i = 0; i < 3; ++i) {
+        const Move best = pool.search(pos, limits, {}, false);
+        check(find_move(pos, pos.move_to_uci(best)) != Move{}, "threads: legal move");
+    }
+    pos.set_fen("6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1");
+    limits.depth = 8;
+    check(pos.move_to_uci(pool.search(pos, limits, {}, false)) == "d1d8",
+          "threads: back-rank mate");
+    // A stop before the search: the helpers stop with the main searcher.
+    pos.set_startpos();
+    limits.depth = 64;
+    pool.request_stop();
+    pool.search(pos, limits, {}, false);
+    pool.clear_stop();
+    pool.set_threads(1);
+    check(pool.threads() == 1, "threads: back to one");
+}
+
+// Pondering: a "go ponder" search ignores its clock until the ponderhit,
+// then keeps to it, counted from the ponderhit; a stop ends it too.
+void test_ponder() {
+    using namespace std::chrono;
+    Position pos;
+    Searcher s(16);
+    SearchLimits limits;
+    limits.ponder = true;
+    limits.movetime = 50;  // + Move Overhead: well under 100 ms once on the clock
+    std::atomic<bool> done{false};
+    Move best{};
+    std::thread t([&] {
+        best = s.search(pos, limits, {}, false);
+        done = true;
+    });
+    std::this_thread::sleep_for(milliseconds(300));
+    check(!done, "ponder: no limits before the ponderhit");
+    const auto hit = steady_clock::now();
+    s.ponderhit();
+    while (!done && steady_clock::now() - hit < seconds(5))
+        std::this_thread::sleep_for(milliseconds(1));
+    t.join();
+    const auto after = duration_cast<milliseconds>(steady_clock::now() - hit).count();
+    check(after < 1000, "ponder: on the clock after the ponderhit (" + std::to_string(after) +
+                            " ms)");
+    // The move to ponder on next is legal after the best move.
+    const Move reply = s.ponder_move(pos, best);
+    StateInfo st;
+    pos.make_move(best, st);
+    check(reply != Move{} && pos.is_legal(reply), "ponder: a legal ponder move");
+    pos.unmake_move(best, st);
+
+    // Pondering on a move the opponent doesn't play: "stop".
+    s.clear_ponderhit();
+    done = false;
+    std::thread t2([&] {
+        s.search(pos, limits, {}, false);
+        done = true;
+    });
+    std::this_thread::sleep_for(milliseconds(100));
+    s.request_stop();
+    t2.join();
+    s.clear_stop();
+    check(done.load(), "ponder: stopped");
 }
 
 // A clock with a millisecond or none left (or run below zero, which the
@@ -296,6 +523,23 @@ void test_picker_completeness() {
             ok &= sorted(s.picker_order(pos, foreign[i], foreign[i + 1], foreign[i + 2])) == expected;
         check(ok, std::string("picker: every legal move exactly once in ") + fen);
     }
+
+    // With QuietCheckBonus, and no history yet (every quiet scores alike),
+    // the quiet checks come before the other quiets.
+    const int bonus = params::quiet_check_bonus;
+    params::quiet_check_bonus = 8000;
+    Position pos;
+    pos.set_fen("4k3/8/8/8/8/8/3N4/R3K3 w - - 0 1");
+    const Position::CheckInfo ci = pos.check_info();
+    bool checks_first = true, seen_plain = false;
+    for (const Move m : Searcher(16).picker_order(pos, Move{}, Move{}, Move{})) {
+        if (pos.piece_at(m.to()) != NO_PIECE) continue;
+        const bool direct = ci.checking_from[pos.piece_at(m.from()) % 6] & bit(m.to());
+        if (direct && seen_plain) checks_first = false;
+        seen_plain |= !direct;
+    }
+    check(checks_first, "picker: quiet checks first with QuietCheckBonus");
+    params::quiet_check_bonus = bonus;
 }
 
 void test_verification() {
@@ -306,8 +550,13 @@ void test_verification() {
     Searcher s(16);
     s.set_verify_rate(1);
     SearchLimits limits;
-    limits.depth = 7;
+    limits.depth = 9;
+    // Null move must get a chance at this depth whatever the tuned
+    // minimum depth is (the tuned pruning left no null-move cutoffs at 7).
+    const int nmp_min_depth = params::nmp_min_depth;
+    params::nmp_min_depth = 3;
     const Move best = s.search(pos, limits, {}, false);
+    params::nmp_min_depth = nmp_min_depth;
     check(find_move(pos, pos.move_to_uci(best)) != Move{}, "verification: legal best move");
 
     std::uint64_t verified = 0;
@@ -321,6 +570,16 @@ void test_verification() {
     check(s.stats().c[prune::LMR].fired > 0, "verification: LMR fired");
     check(s.stats().c[prune::NullMove].fired > 0, "verification: null move fired");
     check(verified > 0, "verification: decisions verified");
+    // Capture reductions are a subset of all reductions.
+    const auto& lmr = s.stats().c[prune::LMR];
+    const auto& lmr_capture = s.stats().c[prune::LmrCapture];
+    check(lmr_capture.tried <= lmr.tried && lmr_capture.fired <= lmr.fired &&
+              lmr_capture.verified <= lmr.verified,
+          "verification: lmr-capture within lmr");
+    for (int k = 0; k < prune::FEATURE_COUNT; ++k) {
+        const auto& f = s.stats().f[static_cast<std::size_t>(k)];
+        check(f.fired <= f.tried, std::string(prune::FEATURE_NAMES[k]) + ": acted <= considered");
+    }
 
     s.clear_stats();
     check(s.stats().c[prune::LMR].tried == 0, "stats cleared");
@@ -396,14 +655,334 @@ void test_features() {
     check(g[8] == 900, "features: queen capture available");
     check(g[11] == 1, "features: passed pawn");
 }
+
+// Syzygy tablebases. Without tables (an empty path) nothing is probed; with
+// the 3-4-5-piece tables in FUNCOMP_SYZYGY (CMake: -DSYZYGY_PATH=...),
+// known results.
+void test_tablebases() {
+    Position pos;
+    check(tb::init("") == 0 && tb::largest() == 0, "tablebases: empty path opens none");
+    pos.set_fen("8/8/8/4k3/8/8/8/4KQ2 w - - 0 1");
+    Searcher plain(16);
+    SearchLimits limits;
+    limits.depth = 6;
+    plain.search(pos, limits, {}, false);
+    check(plain.tb_hits() == 0, "tablebases: no probes without tables");
+
+    const char* path = std::getenv("FUNCOMP_SYZYGY");
+    if (!path || !*path) {
+        std::cout << "Tablebase tests with tables skipped (FUNCOMP_SYZYGY not set).\n";
+        return;
+    }
+    if (tb::init(path) < 5) {
+        check(false, std::string("tablebases: no 5-piece tables in ") + path);
+        return;
+    }
+    auto wdl = [&](const char* fen) {
+        pos.set_fen(fen);
+        return tb::probe_wdl(pos);
+    };
+    check(wdl("8/8/8/4k3/8/8/8/4KQ2 w - - 0 1") == tb::Wdl::Win, "tablebases: KQK won");
+    check(wdl("8/8/8/4k3/8/8/8/4KQ2 b - - 0 1") == tb::Wdl::Loss, "tablebases: KQK lost");
+    check(wdl("8/8/8/4k3/8/8/2b5/4KR2 w - - 0 1") == tb::Wdl::Draw, "tablebases: KRKB drawn");
+    check(wdl("8/8/8/8/8/2k5/8/KBN5 w - - 0 1") == tb::Wdl::Win, "tablebases: KBNK won");
+    check(wdl("8/8/8/4k3/8/8/2b5/4KR2 w - - 3 1") == tb::Wdl::Failed,
+          "tablebases: no WDL probe with a running fifty-move count");
+
+    // The same KBNK win with 90 half-moves gone: too slow for the rule.
+    tb::RootRanking ranking;
+    pos.set_fen("8/8/8/8/8/2k5/8/KBN5 w - - 90 1");
+    check(tb::rank_root(pos, ranking) && !ranking.win && !ranking.loss,
+          "tablebases: KBNK at 90 half-moves is a cursed win");
+    pos.set_fen("8/8/8/8/8/2k5/8/KBN5 w - - 0 1");
+    check(tb::rank_root(pos, ranking) && ranking.win && ranking.dtz,
+          "tablebases: KBNK ranked a win by DTZ");
+    // Every move matched, en passant included.
+    pos.set_fen("8/8/8/k7/2Pp4/8/8/K7 b - c3 0 1");
+    check(tb::rank_root(pos, ranking) &&
+              std::any_of(ranking.moves.begin(), ranking.moves.end(),
+                          [&](const tb::RankedMove& rm) { return rm.move.is_en_passant(); }),
+          "tablebases: root ranking with an en passant capture");
+
+    // Only one move wins (taking the bishop): the search plays it.
+    pos.set_fen("8/8/8/4k3/8/8/3b4/4KR2 w - - 0 1");
+    Searcher s(16);
+    const Move best = s.search(pos, limits, {}, false);
+    check(pos.move_to_uci(best) == "e1d2", "tablebases: the only winning move is played");
+
+    // Six pieces at the root: the search probes once a capture leaves five.
+    pos.set_fen("8/2p5/3k4/8/2r5/8/1Q2N3/K7 w - - 0 1");
+    s.search(pos, limits, {}, false);
+    check(s.tb_hits() > 0, "tablebases: probed inside the search");
+    tb::init("");
+}
 }  // namespace
+
+// LmrParentHist: a quiet reply of positive history to a quiet move of
+// negative history is reduced less, the reverse more; zero is neutral, and
+// the term is off at 0.
+void test_lmr_parent_hist() {
+    const int saved = params::lmr_parent_hist;
+    prune::Context c;
+    c.depth = 10;
+    c.move_index = 10;
+    c.quiet = true;
+    c.parent_quiet = true;
+    auto r = [&](int ours, int parents) {
+        c.history = ours;
+        c.parent_history = parents;
+        return prune::lmr_reduction(c);
+    };
+    params::lmr_parent_hist = 0;
+    const int base_pos = r(1, -1), base_neg = r(-1, 1);
+    check(r(1, -1) == base_pos && r(-1, 1) == base_neg, "lmr parent hist: off, no change");
+    params::lmr_parent_hist = 1024;
+    check(r(1, -1) == base_pos - 1, "lmr parent hist: refutation reduced a ply less");
+    check(r(-1, 1) == base_neg + 1, "lmr parent hist: poor reply reduced a ply more");
+    check(r(0, -1) == r(0, 1) && r(1, 0) == base_pos && r(1, 1) == base_pos,
+          "lmr parent hist: zero or same sign is neutral");
+    c.parent_quiet = false;
+    check(r(1, -1) == base_pos, "lmr parent hist: needs a quiet parent move");
+    params::lmr_parent_hist = saved;
+}
+
+// Initiative: colour-symmetric (a position and its colour-flipped mirror
+// score the same), only the tempo bonus at the start, and off at InitScale 0.
+std::string flip_fen(const std::string& fen) {
+    std::istringstream in(fen);
+    std::string board, side, castling, ep, rest;
+    in >> board >> side >> castling >> ep;
+    std::getline(in, rest);
+    std::vector<std::string> ranks;
+    std::stringstream rs(board);
+    for (std::string r; std::getline(rs, r, '/');) ranks.push_back(r);
+    std::string flipped;
+    for (auto it = ranks.rbegin(); it != ranks.rend(); ++it) {
+        for (char ch : *it)
+            flipped += std::isalpha(static_cast<unsigned char>(ch))
+                           ? static_cast<char>(std::isupper(static_cast<unsigned char>(ch))
+                                                   ? std::tolower(static_cast<unsigned char>(ch))
+                                                   : std::toupper(static_cast<unsigned char>(ch)))
+                           : ch;
+        if (it + 1 != ranks.rend()) flipped += '/';
+    }
+    std::string cast;
+    for (char ch : std::string("KQkq")) {
+        const char from = std::isupper(static_cast<unsigned char>(ch))
+                              ? static_cast<char>(std::tolower(static_cast<unsigned char>(ch)))
+                              : static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        if (castling.find(from) != std::string::npos) cast += ch;
+    }
+    if (cast.empty()) cast = "-";
+    if (ep != "-") ep[1] = ep[1] == '3' ? '6' : '3';
+    return flipped + ' ' + (side == "w" ? "b" : "w") + ' ' + cast + ' ' + ep + rest;
+}
+
+void test_initiative() {
+    const char* fens[] = {
+        "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+        "r2q1rk1/pp2bppp/2n1pn2/3p4/2PP4/2N1PN2/PP2BPPP/R2Q1RK1 b - - 3 10",
+        "2kr3r/ppq2ppp/2n1bn2/2b1p3/4P3/2N1BN2/PPPQBPPP/2KR3R w - - 6 12",
+        "6k1/5ppp/8/3N4/8/8/5PPP/3R2K1 w - - 0 30",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "rnbqkb1r/pp1p1ppp/4pn2/2p5/2PP4/2N5/PP2PPPP/R1BQKBNR w KQkq c6 0 4",
+        "4r1k1/1q3ppp/p7/1p1Q4/3n4/P4N2/1P3PPP/2R3K1 b - - 1 25",
+    };
+    for (const char* fen : fens) {
+        Position a, b;
+        a.set_fen(fen);
+        b.set_fen(flip_fen(fen));
+        check(initiative::evaluate(a) == initiative::evaluate(b),
+              std::string("initiative: mirror-symmetric (") + fen + ")");
+        check(evaluate(a) == evaluate(b), std::string("eval: mirror-symmetric (") + fen + ")");
+    }
+    Position start;
+    check(initiative::evaluate(start) == params::init_tempo * params::init_scale / 100,
+          "initiative: only the tempo bonus at the start");
+    const int scale = params::init_scale;
+    params::init_scale = 0;
+    Position p;
+    p.set_fen(fens[1]);
+    check(initiative::evaluate(p) == 0, "initiative: off at InitScale 0");
+    params::init_scale = scale;
+    // The endgame taper: at phase 3 (a knight and a rook), 50% at phase 0
+    // keeps (3 * 100 + 21 * 50) / 2400 of the untapered term.
+    Position end;
+    end.set_fen(fens[3]);
+    const int pct = params::init_endgame_pct;
+    params::init_endgame_pct = 100;
+    const int full = initiative::evaluate(end);
+    params::init_endgame_pct = 50;
+    check(initiative::evaluate(end) == full * 1350 / 2400, "initiative: endgame taper");
+    Position endm;
+    endm.set_fen(flip_fen(fens[3]));
+    check(initiative::evaluate(end) == initiative::evaluate(endm), "initiative: taper symmetric");
+    params::init_endgame_pct = pct;
+}
+
+// Drawishness: opposite-coloured bishops and close pawnless material scale
+// the eval toward a draw; same-coloured bishops and queen against rook (at
+// a margin of 400, the hand-set one) don't.
+void test_drawish() {
+    const int ocb = params::draw_ocb_pct, pl = params::draw_pawnless_pct;
+    const int margin = params::draw_pawnless_margin;
+    params::draw_pawnless_margin = 400;
+    auto eval_at = [](const char* fen, int pct_ocb, int pct_pl) {
+        params::draw_ocb_pct = pct_ocb;
+        params::draw_pawnless_pct = pct_pl;
+        Position p;
+        p.set_fen(fen);
+        return evaluate(p);
+    };
+    const char* opposite = "4k3/pp3b2/8/8/8/8/PPP5/2B1K3 w - - 0 40";   // c1 dark, f7 light
+    const char* same = "4k3/pp6/3b4/8/8/8/PPP5/2B1K3 w - - 0 40";       // c1 dark, d6 dark
+    const char* rook_bishop = "4k3/8/8/3b4/8/8/8/R3K3 w - - 0 60";
+    const char* queen_rook = "4k3/8/8/3r4/8/8/8/Q3K3 w - - 0 60";
+    const int o100 = eval_at(opposite, 100, 100);
+    check(eval_at(opposite, 50, 100) == o100 * 50 / 100, "drawish: opposite bishops halved");
+    check(eval_at(same, 50, 100) == eval_at(same, 100, 100), "drawish: same-coloured bishops not");
+    const int rb = eval_at(rook_bishop, 100, 100);
+    check(eval_at(rook_bishop, 100, 50) == rb * 50 / 100, "drawish: rook vs bishop halved");
+    check(eval_at(queen_rook, 100, 50) == eval_at(queen_rook, 100, 100),
+          "drawish: queen vs rook not");
+    params::draw_ocb_pct = ocb;
+    params::draw_pawnless_pct = pl;
+    params::draw_pawnless_margin = margin;
+}
+
+// Backrank Bingo: 324 distinct legal starts, the standard one among them;
+// king and rooks at home, bishops on opposite colours, 20 legal moves.
+void test_bingo() {
+    const std::vector<std::string> starts = bingo_starts();
+    check(starts.size() == 324, "bingo: 324 starts");
+    std::set<std::string> distinct(starts.begin(), starts.end());
+    check(distinct.size() == 324, "bingo: all distinct");
+    check(distinct.count("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1") == 1,
+          "bingo: the standard start is one of them");
+    int ok = 0;
+    for (const std::string& fen : starts) {
+        Position pos;
+        if (!pos.set_fen(fen)) continue;
+        MoveList moves;
+        int count = 0;
+        generate_legal(pos, moves, count);
+        bool good = count == 20 && pos.fen() == fen;
+        for (int c = 0; c < 2; ++c) {
+            const int rank = c == 0 ? 0 : 7, base = c * 6;
+            const Bitboard bishops = pos.pieces(static_cast<Piece>(base + 2));
+            int light = 0;
+            for (Bitboard b = bishops; b; b &= b - 1) {
+                const int s = std::countr_zero(b);
+                light += (file_of(s) + rank_of(s)) % 2;
+                good = good && rank_of(s) == rank;
+            }
+            good = good && std::popcount(bishops) == 2 && light == 1;
+            good = good && pos.pieces(static_cast<Piece>(base + 5)) == bit(sq(4, rank)) &&
+                   pos.pieces(static_cast<Piece>(base + 3)) == (bit(sq(0, rank)) | bit(sq(7, rank)));
+        }
+        ok += good;
+    }
+    check(ok == 324, "bingo: legal, 20 moves, kings and rooks home, bishops opposite (" +
+                         std::to_string(ok) + " of 324)");
+}
+
+// Continuation logging: off in normal builds (genconlog refuses); in a
+// CONT_LOG build a short run writes nodes and rows that add up.
+void test_cont_log() {
+    ContLogOptions opt;
+    opt.out = "cont_log_test";
+    opt.games = 1;
+    opt.random_plies = 4;
+    opt.nodes = 4000;
+    opt.rate = 4;
+    std::ostringstream log;
+    const std::uint64_t rows = generate_cont_log(opt, log);
+    if (!CONT_LOG_BUILD) {
+        check(rows == 0, "cont log: compiled out, genconlog refuses");
+        return;
+    }
+    check(rows > 0, "cont log: rows written");
+    std::ifstream nodes("cont_log_test.nodes.csv");
+    std::string line;
+    std::getline(nodes, line);
+    std::uint64_t sum = 0;
+    while (std::getline(nodes, line)) sum += std::stoull(line.substr(line.rfind(',') + 1));
+    check(sum == rows, "cont log: the nodes' row counts add up");
+}
+
+// The learned-guide hook (prune::guide): a guide that returns the hand value
+// leaves the search exactly as it is; every guided heuristic consults it,
+// with a valid context; and its answers are held to the allowed band.
+int guide_calls[prune::COUNT];
+int guide_bad_context = 0;
+int identity_guide(prune::Heuristic h, const prune::Context& c, int hand) {
+    ++guide_calls[h];
+    if (!c.pos || c.depth < 0) ++guide_bad_context;
+    return hand;
+}
+int extreme_guide(prune::Heuristic, const prune::Context&, int hand) { return hand + 100000; }
+
+void test_guide() {
+    auto nodes_at = [](const char* fen) {
+        Position pos;
+        pos.set_fen(fen);
+        Searcher s(16);
+        s.new_game();
+        SearchLimits limits;
+        limits.depth = 10;
+        s.search(pos, limits, {}, false);
+        return s.nodes();
+    };
+    const char* fen = "r1bq1rk1/pp2bppp/2n1pn2/3p4/2PP4/2N1PN2/PP2BPPP/R2QKB1R w KQ - 2 8";
+    const std::uint64_t plain = nodes_at(fen);
+    std::fill(std::begin(guide_calls), std::end(guide_calls), 0);
+    prune::guide = identity_guide;
+    const std::uint64_t guided = nodes_at(fen);
+    prune::guide = nullptr;
+    check(guided == plain, "guide: an identity guide leaves the search unchanged (" +
+                               std::to_string(guided) + " vs " + std::to_string(plain) + ")");
+    for (const prune::Heuristic h : {prune::RFP, prune::Razor, prune::NullMove, prune::LMP,
+                                     prune::Futility, prune::HistoryPrune, prune::SeeQuiet,
+                                     prune::SeeCapture, prune::QsSee, prune::LMR})
+        check(guide_calls[h] > 0, std::string("guide: consulted for ") + prune::NAMES[h]);
+    check(guide_bad_context == 0, "guide: always given a position and a depth");
+
+    Position pos;
+    pos.set_fen(fen);
+    prune::Context c;
+    c.pos = &pos;
+    c.depth = 5;
+    c.move_index = 10;
+    c.quiet = true;
+    const int rfp = prune::rfp_margin(c);
+    const int lmr = prune::lmr_reduction(c);
+    prune::guide = extreme_guide;
+    const int w = std::max(std::abs(rfp) * params::guide_margin_pct / 100, params::guide_margin_min);
+    check(prune::rfp_margin(c) == rfp + w, "guide: a margin held to its band");
+    check(prune::lmr_reduction(c) == lmr + params::guide_reduction_delta,
+          "guide: a reduction held to its band");
+    prune::guide = nullptr;
+}
 
 int main() {
     test_see();
+    test_mop_up();
     test_null_move();
     test_mates();
     test_pv_stops_at_draws();
     test_stop_request();
+    test_lmr_parent_hist();
+    test_initiative();
+    test_drawish();
+    test_bingo();
+    test_cont_log();
+    test_guide();
+    test_thread_pool();
+    test_pgn();
+    test_ponder();
+    test_tt_key();
+    test_root_move_nodes();
     test_empty_clock();
     test_fen_clocks();
     test_reversible_move();
@@ -412,6 +991,7 @@ int main() {
     test_label_sampling();
     test_label_rows();
     test_features();
+    test_tablebases();
     if (failures) {
         std::cerr << failures << " search test(s) failed.\n";
         return 1;

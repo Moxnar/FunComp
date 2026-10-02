@@ -4,6 +4,7 @@
 #include "types.h"
 #include <array>
 #include <bit>
+#include <cassert>
 #include <cstdint>
 #include <string>
 
@@ -69,7 +70,18 @@ public:
     }
 
     // Also records in st.dirty every piece-square change the move makes.
-    void make_move(Move move, StateInfo& st);
+    void make_move(Move move, StateInfo& st) {
+        apply_move(move, st);
+        checkers_ = compute_checkers();
+    }
+    // For a caller that already knows gives_check(move): a move that gives
+    // no check leaves the opponent without checkers, so there's nothing to
+    // compute.
+    void make_move(Move move, StateInfo& st, bool gives_check) {
+        apply_move(move, st);
+        checkers_ = gives_check ? compute_checkers() : 0;
+        assert(checkers_ == compute_checkers());
+    }
     void unmake_move(Move move, const StateInfo& st);
 
     // True if legal move `m` would put the opponent in check, directly or
@@ -144,6 +156,8 @@ private:
     std::uint64_t compute_pawn_key() const;
     std::uint64_t compute_nonpawn_key(int c) const;
     Bitboard compute_checkers() const;
+    // make_move without the checkers update.
+    void apply_move(Move move, StateInfo& st);
     bool in_check_slow(Color c) const;
 
     // Incremental board updates. Each keeps bb_, color_bb_, occupied_ and

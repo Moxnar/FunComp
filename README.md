@@ -1,11 +1,13 @@
 # FunComp
 
 A UCI chess engine written in C++23 from the ground up: a classical
-evaluation (PeSTO's tables) and a modern alpha-beta search in which every
-feature was proven in games before it was kept. Version 1.0 is estimated
-at about **3030 on the CCRL Blitz scale** (3031 ± 14 from a gauntlet of
-2,040 games against 17 rated engines from eight families; an estimate on
-our hardware, not an official CCRL rating). Single-threaded.
+evaluation (PeSTO's tables and an initiative term of our own) and a
+modern alpha-beta search in which every feature was proven in games
+before it was kept, then tuned as a whole. Version 2.0 is estimated at
+about **3280 on the CCRL Blitz scale** (3282 ± 10 from a single-threaded
+gauntlet of 2,880 games against 24 rated engines from eight families; an
+estimate on our hardware, not an official CCRL rating), about 245 above
+version 1.0. It searches with as many threads as you give it.
 
 ## Features
 
@@ -16,8 +18,19 @@ our hardware, not an official CCRL rating). Single-threaded.
   side's non-pawn material) learns during the search how far the static
   eval tends to be off and corrects it; scores shrink toward a draw as
   the fifty-move counter runs.
+- **Initiative:** a term for who is making the other side respond:
+  threats pending against the side to move and threats it holds, safe
+  mobility, territory, coordination, pawn-push threats, safe checks,
+  king pressure, and the move itself. Colour-symmetric, clamped, and
+  tuned with the search.
+- **Drawishness:** the eval is scaled toward a draw for opposite-coloured
+  bishops alone and for pawnless endings with a small material gap; a
+  bare king is driven to the edge (and, against bishop and knight, to
+  the bishop's corner).
 - **Search:** iterative deepening, principal variation search with
   aspiration windows, quiescence search with SEE pruning.
+- **Parallel search:** Lazy SMP; threads share a lockless transposition
+  table.
 - **Transposition table:** four-entry buckets with aging; entries
   remember whether the position was on a principal variation.
 - **Move ordering:** a staged picker: hash move, winning captures (by
@@ -32,12 +45,19 @@ our hardware, not an official CCRL rating). Single-threaded.
 - **Draws:** repetitions and the fifty-move rule (checkmate on the
   hundredth ply still counts), and detection of a repetition one move
   away.
-- **Time management:** soft and hard limits, more time when the best
-  move keeps changing or the score drops.
+- **Time management:** soft and hard limits, scaled by how settled the
+  search looks: how long the best move has held, whether the score
+  dropped, and how much of the search went into the best move. Pondering
+  is supported.
+- **Endgame tablebases:** Syzygy WDL probes in the search and DTZ
+  ranking at the root (through Fathom), so won endings are converted
+  within the fifty-move rule.
 
 Every change was tested in games (an SPRT against the previous best
-version) before it was kept. Ideas that did not pay are still in the
-code, switched off, for the tuning pass of the next version. Every margin
+version) before it was kept. For 2.0, all of the search's parameters
+(about 110) were then tuned together by SPSA in two full passes, and the
+time management in a pass of its own; ideas that did not pay are still
+in the code, switched off. Every margin
 and threshold lives in `src/params.h`, and the search reaches them through
 `src/pruning.h`, which is built so that a learned model can later guide
 the pruning (see "Learned pruning" below).
@@ -48,20 +68,37 @@ FunComp speaks UCI: load it in any UCI GUI (Arena, Cute Chess, BanksiaGUI,
 En Croissant, ...) or match runner (fastchess, cutechess-cli). The release
 has two Windows binaries:
 
-- `funcomp-1.0-x86-64-v3.exe` for CPUs with AVX2 and BMI2 (Intel
+- `funcomp-2.0-x86-64-v3.exe` for CPUs with AVX2 and BMI2 (Intel
   Haswell, AMD Zen and later): the faster one;
-- `funcomp-1.0-x86-64.exe` for any 64-bit x86 CPU.
+- `funcomp-2.0-x86-64.exe` for any 64-bit x86 CPU.
 
 Options:
 
 - `Hash` (MB, default 64, 1-4096): transposition table size.
+- `Threads` (default 1, 1-256): search threads (Lazy SMP: they share
+  the transposition table).
+- `Ponder` (default false): the GUI may let FunComp think on the
+  opponent's time (`go ponder`, `ponderhit`); `bestmove` always names the
+  move it expects in reply.
+- `TelemetryDir` (default `<empty>`): for testing; each engine process
+  writes its pruning and feature counters over the session to a file of
+  its own in this directory when it quits (`tools/telemetry-sum.sh`
+  adds them up).
 - `Move Overhead` (ms, default 30, 0-5000): time kept in reserve per move
   for GUI and network latency.
+- `SyzygyPath` (default `<empty>`): directories holding Syzygy tables,
+  separated by `;` on Windows and `:` elsewhere.
+- `SyzygyProbeLimit` (pieces, default 7, 0-7): probe positions with at
+  most this many pieces (and no more than the tables hold).
+- `SyzygyProbeDepth` (default 1, 1-100): at the largest piece count,
+  probe only at this depth or more (for tables on a slow disk).
 
 Beyond UCI, from a console:
 
 ```text
 d                     show the board
+eval                  the static eval, with the initiative term broken
+                      down
 perft <depth>         count leaf nodes
 bench [depth]         search a fixed position set; prints pruning
                       statistics, total nodes and nps
@@ -69,9 +106,18 @@ bench [depth]         search a fixed position set; prints pruning
 pstats                pruning statistics since the last "pstats reset"
 pstats reset
 genlabels ...         write labels for the learned pruning guide (below)
+genbingo out=<file> [plies=N perstart=N nodes=N maxscore=CP seed=N hash=MB]
+                      Backrank Bingo openings: the standard back rank
+                      with queen, opposite-coloured bishops and knights
+                      shuffled over b, c, d, f and g (324 starts)
+genconlog ...         continuation logs (research builds only, configured
+                      with -DCONT_LOG=ON; see src/cont_log.h)
+telemetry in=<pgn> [positions=N nodes=N verify=N minply=N seed=N]
+                      pruning and feature counters, with verification,
+                      on positions sampled from the games of a PGN file
 ```
 
-The bench node count is the search's signature (2780319 for 1.0): a
+The bench node count is the search's signature (1614718 for 2.0): a
 change meant to alter the search changes it, and a refactor or speedup
 must not.
 
@@ -132,15 +178,16 @@ for SPRTs, a balanced book such as 8moves_v3 for ratings).
   moves, and how many plies wins took from +10 pawns to mate.
 - **`gauntlet.ps1`** and **`rating.awk`**: games against rated opponents
   from a balanced book, one game per physical core (hyper-threading would
-  bias an absolute result), and one rating fitted to the PGN. The 1.0
-  gauntlet's opponents and their CCRL Blitz ratings are in
-  `tools/gauntlet-1.0.txt`, one per line as `file=rating`, optionally
-  with `;name=...` (the name in the PGN) and `;option.Name=value`;
-  `tools/opponents.sha256` has the checksums of the opponents' official
-  binaries.
+  bias an absolute result), and one rating fitted to the PGN. The
+  gauntlets' opponents and their CCRL Blitz ratings are in
+  `tools/gauntlet-1.0.txt` and `tools/gauntlet-2.0.txt`, one per line as
+  `file=rating`, optionally with `;name=...` (the name in the PGN),
+  `;dir=...` (a working directory) and `;option.Name=value`;
+  `tools/opponents.sha256` has the checksums of the opponents' binaries
+  and source archives.
 
   ```powershell
-  tools\gauntlet.ps1 -Engine funcomp.exe -Opponents (Get-Content tools\gauntlet-1.0.txt) -Rounds 60 -Pgn gauntlet.pgn
+  tools\gauntlet.ps1 -Engine funcomp.exe -Opponents (Get-Content tools\gauntlet-2.0.txt) -Rounds 60 -Pgn gauntlet.pgn
   ```
 
   ```bash
@@ -151,6 +198,14 @@ for SPRTs, a balanced book such as 8moves_v3 for ratings).
   engines choose the same best move on a sample of positions.
 - **`wdl.awk`**: the eval's scale, as win and draw rates by reported
   score, from self-play PGNs.
+- **`telemetry-sum.sh`**: adds up the counter files that `TelemetryDir`
+  collects during a match, side by side for two builds.
+- **`convert.sh`**: endgame conversion, which match adjudication hides:
+  an engine plays both sides of won positions (`tools/bare-king.epd`,
+  `tools/tb-wins.epd`) and the plies to mate are counted.
+- **`scaling.sh`**: node rate and depth by thread count.
+- **`research/`**: Python scripts (numpy, scipy) for the learned-pruning
+  studies, on `genlabels` and `genconlog` output.
 
 ## Learned pruning
 
@@ -185,7 +240,9 @@ searched score can land from the static eval. In place today:
    often, default 200, which roughly evens out the depths), `maxdepth=`
    (deepest node depth sampled, default 8), `count=` (row limit),
    `seed=`, `hash=` (driver, MB), `labelhash=` (labeller, MB; cleared
-   before every label so labels don't depend on processing order).
+   before every label so labels don't depend on processing order),
+   `labelnodes=` (a node cap per labelling search; rows it stops are
+   marked censored).
 
    Columns: `fen, depth, ply, static_eval, correction, search_eval, alpha,
    beta, improving, node, under_null, iir, score, mate`, then the hand
@@ -198,8 +255,14 @@ searched score can land from the static eval. In place today:
    the node's window in the tree, `node` is `pv`, `cut` or `all`. `depth`
    is what node-level pruning saw; `iir` is 1 if the node's moves were then
    searched a ply shallower. Mate scores are clipped to +-2000 and flagged
-   in `mate`. The run's options and search parameters are written to
-   `<out>.params`.
+   in `mate`. Then the columns for a cost model: `group` (the game or
+   input line, for splitting data), `rate` (the depth's sampling rate),
+   the hash entry the node found (`tt_hit, tt_depth, tt_bound`), what the
+   node cost in the tree (`tree_nodes`, and `reached_moves`: 0 if
+   node-level pruning ended it), and what the labelling search cost from
+   a cold start (`fresh_nodes`, `censored`, and per iteration
+   `fresh_curve` and `score_curve`, `;`-separated). The run's options,
+   git commit and search parameters are written to `<out>.params`.
 
 ## Credits
 
@@ -217,6 +280,9 @@ decades of published work by the chess-programming community.
 - **Evaluation.** The piece-square tables and material values are
   PeSTO's, by Ronald Friederich, as published on the Chess Programming
   Wiki.
+- **Tablebases.** Syzygy tables and their original probing code are by
+  Ronald de Man; FunComp reads them through Fathom (basil00, Jon Dart;
+  MIT licence, in `third_party/fathom` with its licence file).
 - **Published algorithms.** Static exchange evaluation uses the wiki's
   gain-array swap algorithm; sliders use magic bitboards; move ordering
   values pieces as in Tomasz Michniewski's Simplified Evaluation

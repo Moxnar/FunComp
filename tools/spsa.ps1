@@ -55,11 +55,19 @@ param(
     [int] $Concurrency = 4,
     # Options set to fixed values in both engines, as Name=Value strings:
     # a switch the tuned parameters depend on, say.
-    [string[]] $Options = @()
+    [string[]] $Options = @(),
+    # Keep the games: each iteration's PGN goes to <PgnDir>\<iteration>.pgn
+    # (a file each, so workers never write to the same one). For data
+    # pools, not for the tune.
+    [string] $PgnDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
 
+if ($PgnDir) {
+    New-Item -ItemType Directory -Force -Path $PgnDir | Out-Null
+    $PgnDir = (Resolve-Path $PgnDir).Path
+}
 foreach ($f in @($Engine, $Params, $Book, $Fastchess)) {
     if (-not (Test-Path $f)) { throw "Not found: $f" }
 }
@@ -158,6 +166,7 @@ function Start-Iteration([int] $k) {
         # fastchess saves its state to config.json in the working directory
         # by default; every worker needs its own file.
         '-config', "outname=$(Join-Path $tmp "$k.json")")
+    if ($PgnDir) { $fcArgs += @('-pgnout', "file=$(Join-Path $PgnDir "$k.pgn")") }
     $out = Join-Path $tmp "$k.out"
     # Start-Process joins the arguments with spaces (PowerShell 5.1): quote
     # any with a space in it (the temp path does, under a user name with one).

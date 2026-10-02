@@ -1,18 +1,26 @@
 #include "uci.h"
 #include "bench.h"
+#include "bingo.h"
+#include "cont_log.h"
+#include "eval.h"
+#include "initiative.h"
 #include "labels.h"
 #include "position.h"
 #include "movegen.h"
 #include "perft.h"
 #include "search.h"
 #include "params.h"
+#include "tablebase.h"
+#include "telemetry.h"
+#include "threads.h"
 #include <algorithm>
 #include <chrono>
-#include <condition_variable>
-#include <functional>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
-#include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -48,69 +56,24 @@ bool apply_uci_move(Position& pos, const std::string& uci, std::vector<std::uint
     return false;
 }
 
-// A thread that lives as long as the UCI loop and runs one job at a time,
-// sleeping in between. Starting a new thread for each "go" would be
-// simpler, but on a busy machine a new thread can wait tens of
-// milliseconds for its first time slice, all of it on the engine's clock:
-// measured with 24 match games on 24 hardware threads, a median of 6 ms
-// and up to 47 ms, where waking a waiting thread took 15 us.
-class Worker {
-public:
-    Worker() : thread_([this] { run(); }) {}
-    ~Worker() {
-        {
-            std::lock_guard lock(mutex_);
-            quit_=true;
-        }
-        cv_.notify_all();
-        thread_.join();  // after the job in hand, if any
-    }
-
-    // Starts `job` on the thread. The previous job must have finished.
-    void start(std::function<void()> job) {
-        {
-            std::lock_guard lock(mutex_);
-            job_=std::move(job);
-            busy_=true;
-        }
-        cv_.notify_all();
-    }
-    bool busy() {
-        std::lock_guard lock(mutex_);
-        return busy_;
-    }
-    void wait() {
-        std::unique_lock lock(mutex_);
-        cv_.wait(lock,[this] { return !busy_; });
-    }
-
-private:
-    void run() {
-        std::unique_lock lock(mutex_);
-        while(true) {
-            cv_.wait(lock,[this] { return job_ || quit_; });
-            if(!job_) return;  // quitting, with nothing left to do
-            auto job=std::move(job_);
-            job_=nullptr;
-            lock.unlock();
-            job();
-            lock.lock();
-            busy_=false;
-            cv_.notify_all();
-        }
-    }
-
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::function<void()> job_;
-    bool busy_=false, quit_=false;
-    std::thread thread_;  // last: it starts running once the rest exists
-};
+// Match telemetry (TelemetryDir): this process's counters over all its
+// searches, in a file of its own (many engine processes write at once),
+// summed across files by tools/telemetry-sum.sh.
+void write_telemetry(const std::string& dir, const prune::Stats& stats) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::string name = "telemetry-" + std::to_string(stamp) + "-" +
+                             std::to_string(std::random_device{}()) + ".txt";
+    std::ofstream out(std::filesystem::path(dir) / name);
+    stats.write(out);
+}
 }
 
 void uci_loop() {
     Position pos;
-    Searcher searcher;
+    ThreadPool pool;  // the searchers, one per thread
+    std::string telemetry_dir;  // TelemetryDir: empty, no match telemetry
     std::vector<std::uint64_t> history;  // keys of the game's earlier positions
     std::string line;
 
@@ -118,14 +81,14 @@ void uci_loop() {
     // answered while it thinks. Any other command first stops a running
     // search and waits for its bestmove (a GUI only sends them between
     // searches): so the search thread has the position, the history and
-    // the searcher to itself, and "go infinite" can't be left waiting for
+    // the searchers to themselves, and "go infinite" can't be left waiting for
     // a "stop" that sits behind the command being handled.
     Worker search_thread;
     auto finish_search=[&] {
         if(search_thread.busy()) {
-            searcher.request_stop();
+            pool.request_stop();
             search_thread.wait();
-            searcher.clear_stop();  // or it would cut short a later "bench"
+            pool.clear_stop();  // or it would cut short a later "bench"
         }
     };
 
@@ -141,16 +104,28 @@ void uci_loop() {
             std::cout << "readyok\n" << std::flush;  // one write: a search may be printing
             continue;
         }
-        if(cmd=="ponderhit") continue;  // no pondering (no Ponder option)
+        // The opponent played the move we were pondering on: the search goes
+        // on, now on the clock.
+        if(cmd=="ponderhit") { pool.ponderhit(); continue; }
         finish_search();  // "stop" is exactly this
         if(cmd=="quit") break;
 
         if(cmd=="uci") {
-            std::cout << "id name FunComp 1.0\n";
+            std::cout << "id name FunComp 2.0\n";
             std::cout << "id author Moxnar\n";
             std::cout << "option name Hash type spin default 64 min 1 max 4096\n";
+            std::cout << "option name Threads type spin default 1 min 1 max " << MAX_THREADS << '\n';
+            // Only tells the GUI it may send "go ponder"; nothing to set.
+            std::cout << "option name Ponder type check default false\n";
             std::cout << "option name Move Overhead type spin default " << params::move_overhead
                       << " min 0 max 5000\n";
+            std::cout << "option name SyzygyPath type string default <empty>\n";
+            // Counters over the whole session, written at exit (for matches).
+            std::cout << "option name TelemetryDir type string default <empty>\n";
+            std::cout << "option name SyzygyProbeLimit type spin default " << tb::probe_limit
+                      << " min 0 max 7\n";
+            std::cout << "option name SyzygyProbeDepth type spin default " << tb::probe_depth
+                      << " min 1 max 100\n";
 #ifdef TUNE
             // Diagnostics and tuning only; still settable in any build.
             std::cout << "option name PruneVerify type spin default 0 min 0 max 1000000\n";
@@ -174,13 +149,29 @@ void uci_loop() {
             }
             if(name=="Move Overhead" && !value.empty()) {
                 params::move_overhead=std::clamp(std::stoi(value),0,5000);
+            } else if(name=="Threads" && !value.empty()) {
+                pool.set_threads(std::clamp(std::stoi(value),1,MAX_THREADS));
             } else if(name=="Hash" && !value.empty()) {
                 const long mb=std::stol(value);
-                searcher.resize_hash(static_cast<std::size_t>(std::clamp(mb,1L,4096L)));
+                pool.resize_hash(static_cast<std::size_t>(std::clamp(mb,1L,4096L)));
+            } else if(name=="TelemetryDir") {
+                telemetry_dir = value=="<empty>" ? std::string() : value;
+            } else if(name=="SyzygyPath") {
+                const int pieces=tb::init(value);
+                if(pieces)
+                    std::cout << "info string Syzygy tablebases found, up to " << pieces
+                              << " pieces\n" << std::flush;
+                else if(!value.empty() && value!="<empty>")
+                    std::cout << "info string no Syzygy tablebases found in " << value
+                              << '\n' << std::flush;
+            } else if(name=="SyzygyProbeLimit" && !value.empty()) {
+                tb::probe_limit=std::clamp(std::stoi(value),0,7);
+            } else if(name=="SyzygyProbeDepth" && !value.empty()) {
+                tb::probe_depth=std::clamp(std::stoi(value),1,100);
             } else if(name=="PruneVerify" && !value.empty()) {
                 // Check 1 in N pruning decisions by searching anyway; see
                 // "pstats". Diagnostic only: slows and alters the search.
-                searcher.set_verify_rate(std::stoi(value));
+                pool.main().set_verify_rate(std::stoi(value));
             } else if(!value.empty()) {
                 // Search parameters are always settable, even when a normal
                 // build doesn't advertise them.
@@ -190,7 +181,7 @@ void uci_loop() {
         } else if(cmd=="ucinewgame") {
             pos.set_startpos();
             history.clear();
-            searcher.new_game();
+            pool.new_game();
         } else if(cmd=="position") {
             std::string arg;
             ss >> arg;
@@ -237,21 +228,37 @@ void uci_loop() {
                 else if(arg=="movestogo") ss>>limits.movestogo;
                 else if(arg=="nodes") ss>>limits.nodes;
                 else if(arg=="infinite") limits.infinite=true;
+                else if(arg=="ponder") limits.ponder=true;
             }
             // Bare "go" with no limits searches until "stop", like "go infinite".
             const bool has_clock = limits.time[static_cast<int>(pos.side_to_move())] >= 0;
             if(!limits.depth && !limits.movetime && !limits.nodes && !has_clock) limits.infinite=true;
-            searcher.clear_stop();
-            search_thread.start([&searcher,&pos,&history,limits] {
-                const Move best=searcher.search(pos,limits,history);
+            pool.clear_stop();
+            pool.clear_ponderhit();
+            search_thread.start([&pool,&pos,&history,limits] {
+                const Move best=pool.search(pos,limits,history);
                 // With "go infinite" the GUI decides when the search is over: no
                 // bestmove before "stop", even if the search ran out first (a mate
-                // found, or the maximum depth).
-                if(limits.infinite)
-                    while(!searcher.stop_requested())
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                std::cout << "bestmove " + (best==Move{} ? std::string("0000") : pos.move_to_uci(best)) + "\n"
-                          << std::flush;
+                // found, or the maximum depth). Nor while pondering, before the
+                // ponderhit (a ponderhit after a finished search answers at once).
+                auto waiting=[&] {
+                    if(pool.stop_requested()) return false;
+                    return limits.infinite || (limits.ponder && !pool.ponderhit_received());
+                };
+                while(waiting()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::string out="bestmove "+(best==Move{} ? std::string("0000") : pos.move_to_uci(best));
+                const Move reply=pool.main().ponder_move(pos,best);
+                if(reply!=Move{}) {
+                    // The reply is a move in the position after `best`.
+                    StateInfo st;
+                    pos.make_move(best,st);
+                    out+=" ponder "+pos.move_to_uci(reply);
+                    pos.unmake_move(best,st);
+                }
+                std::cout << out+"\n" << std::flush;
+                // Only now: the move mustn't wait on helpers still stopping.
+                // Every later command waits for this job, so for them too.
+                pool.wait_helpers();
             });
         } else if(cmd=="perft") {
             // "perft <depth>" uses the hash table; "perft <depth> nohash" doesn't.
@@ -275,21 +282,46 @@ void uci_loop() {
                       << '\n';
         } else if(cmd=="d") {
             print_board(pos);
+        } else if(cmd=="eval") {
+            // Static evaluation with the initiative term broken down (not
+            // corrected, not fifty-move scaled).
+            initiative::print_trace(pos, std::cout);
+            std::cout << "info string static eval " << evaluate(pos) << " cp (side to move)"
+                      << std::endl;
         } else if(cmd=="bench") {
             // "bench [depth]"
             int depth=BENCH_DEPTH;
             ss>>depth;
-            bench(searcher,depth,std::cout);
+            bench(pool.main(),depth,std::cout);
         } else if(cmd=="pstats") {
             // "pstats" prints pruning statistics accumulated since the last
             // "pstats reset"; "pstats reset" clears them.
             std::string arg;
-            if(ss>>arg && arg=="reset") searcher.clear_stats();
-            else searcher.stats().print(std::cout);
+            if(ss>>arg && arg=="reset") pool.main().clear_stats();
+            else pool.main().stats().print(std::cout);
+        } else if(cmd=="telemetry") {
+            // "telemetry in=<pgn> [positions=N] [nodes=N] [verify=N]
+            //  [minply=N] [seed=N]": counters on positions from a PGN's
+            // games; see telemetry.h.
+            TelemetryOptions opt;
+            std::string tok;
+            while(ss>>tok) {
+                const auto eq=tok.find('=');
+                if(eq==std::string::npos) continue;
+                const std::string key=tok.substr(0,eq), val=tok.substr(eq+1);
+                if(key=="in") opt.in=val;
+                else if(key=="positions") opt.positions=std::max(1,std::stoi(val));
+                else if(key=="nodes") opt.nodes=std::stoull(val);
+                else if(key=="verify") opt.verify=std::max(0,std::stoi(val));
+                else if(key=="minply") opt.min_ply=std::max(0,std::stoi(val));
+                else if(key=="seed") opt.seed=std::stoull(val);
+            }
+            if(opt.in.empty()) std::cout << "info string telemetry needs in=<pgn>" << std::endl;
+            else game_telemetry(pool.main(),opt,std::cout);
         } else if(cmd=="genlabels") {
             // "genlabels out=<file> [in=<file>] [games=N] [randomplies=N]
             //  [depth=N] [sample=N] [depthscale=PCT] [maxdepth=N] [count=N]
-            //  [seed=N] [hash=MB] [labelhash=MB]"
+            //  [seed=N] [hash=MB] [labelhash=MB] [labelnodes=N]"
             // Writes pruning labels; see labels.h.
             LabelOptions opt;
             std::string tok;
@@ -309,12 +341,56 @@ void uci_loop() {
                 else if(key=="seed") opt.seed=std::stoull(val);
                 else if(key=="hash") opt.hash_mb=std::clamp(std::stoi(val),1,4096);
                 else if(key=="labelhash") opt.label_hash_mb=std::clamp(std::stoi(val),1,4096);
+                else if(key=="labelnodes") opt.label_node_cap=std::stoull(val);
             }
             if(opt.out.empty()) std::cout << "info string genlabels needs out=<file>" << std::endl;
             else generate_labels(opt,std::cout);
+        } else if(cmd=="genbingo") {
+            // "genbingo out=<file> [plies=N] [perstart=N] [nodes=N]
+            //  [maxscore=CP] [seed=N] [hash=MB]": Backrank Bingo openings;
+            // see bingo.h.
+            BingoOptions opt;
+            std::string tok;
+            while(ss>>tok) {
+                const auto eq=tok.find('=');
+                if(eq==std::string::npos) continue;
+                const std::string key=tok.substr(0,eq), val=tok.substr(eq+1);
+                if(key=="out") opt.out=val;
+                else if(key=="plies") opt.plies=std::max(0,std::stoi(val));
+                else if(key=="perstart") opt.per_start=std::max(1,std::stoi(val));
+                else if(key=="nodes") opt.nodes=std::stoull(val);
+                else if(key=="maxscore") opt.max_score=std::stoi(val);
+                else if(key=="seed") opt.seed=std::stoull(val);
+                else if(key=="hash") opt.hash_mb=std::clamp(std::stoi(val),1,4096);
+            }
+            if(opt.out.empty()) std::cout << "info string genbingo needs out=<file>" << std::endl;
+            else generate_bingo(opt,std::cout);
+        } else if(cmd=="genconlog") {
+            // "genconlog out=<prefix> [games=N] [randomplies=N] [nodes=N]
+            //  [mindepth=N] [rate=N] [depthscale=PCT] [seed=N] [hash=MB]":
+            // continuation logs from self-play; see cont_log.h.
+            ContLogOptions opt;
+            std::string tok;
+            while(ss>>tok) {
+                const auto eq=tok.find('=');
+                if(eq==std::string::npos) continue;
+                const std::string key=tok.substr(0,eq), val=tok.substr(eq+1);
+                if(key=="out") opt.out=val;
+                else if(key=="games") opt.games=std::max(1,std::stoi(val));
+                else if(key=="randomplies") opt.random_plies=std::max(0,std::stoi(val));
+                else if(key=="nodes") opt.nodes=std::stoull(val);
+                else if(key=="mindepth") opt.min_depth=std::clamp(std::stoi(val),1,63);
+                else if(key=="rate") opt.rate=std::max(1,std::stoi(val));
+                else if(key=="depthscale") opt.depth_scale=std::max(100,std::stoi(val));
+                else if(key=="seed") opt.seed=std::stoull(val);
+                else if(key=="hash") opt.hash_mb=std::clamp(std::stoi(val),1,4096);
+            }
+            if(opt.out.empty()) std::cout << "info string genconlog needs out=<prefix>" << std::endl;
+            else generate_cont_log(opt,std::cout);
         }
     }
     // End of input (the GUI went away): the search mustn't outlive the
-    // searcher.
+    // searchers.
     finish_search();
+    if(!telemetry_dir.empty()) write_telemetry(telemetry_dir,pool.total_stats());
 }
