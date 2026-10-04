@@ -1,12 +1,12 @@
 # FunComp
 
 A UCI chess engine written in C++23 from the ground up: a classical
-evaluation (PeSTO's tables and an initiative term of our own) and a
+evaluation (PeSTO's tables and an initiative term of my own) and a
 modern alpha-beta search in which every feature was proven in games
 before it was kept, then tuned as a whole. Version 2.0 is estimated at
 about **3280 on the CCRL Blitz scale** (3282 ± 10 from a single-threaded
 gauntlet of 2,880 games against 24 rated engines from eight families; an
-estimate on our hardware, not an official CCRL rating), about 245 above
+estimate on my hardware, not an official CCRL rating), about 245 above
 version 1.0. It searches with as many threads as you give it.
 
 ## Features
@@ -264,6 +264,27 @@ searched score can land from the static eval. In place today:
    `fresh_curve` and `score_curve`, `;`-separated). The run's options,
    git commit and search parameters are written to `<out>.params`.
 
+## How FunComp was written
+
+FunComp was written with AI tools, specifically Claude Code. Writing
+software today is not what it was even a few years ago, and that
+deserves saying plainly.
+
+The hypotheses are mine. The roadmap is mine. The testing pipeline is
+mine. I've worked to make every piece of code original work, guided by
+me. But the people who came before me worked their ideas out by hand,
+and I have not. I started in computer chess around 1995, and the first
+move generator I ever wrote was in Perl, so I know the difference AI
+has made. Writing every line by hand is a craft I haven't spent the
+years to hone, and I don't claim the craftsmanship that so many in this
+hobby have earned.
+
+What I do have is ideas. Claude helps me turn them into code, test
+them, and move through the engineering far faster than I could alone.
+My hope is to contribute something genuine to the chess engine
+community: alternate approaches to modern problems, proven by results.
+I couldn't do that without these tools. And after all, this is FunComp.
+
 ## Credits
 
 FunComp's code is its own, but its ideas mostly are not: they come from
@@ -273,7 +294,7 @@ decades of published work by the chess-programming community.
   throughout. Stockfish influenced FunComp's development more than any
   other engine: many of the search techniques here (singular and negative
   extensions, ProbCut, continuation and correction histories, the ttPv
-  flag, upcoming-repetition detection) are ideas we learned from it and
+  flag, upcoming-repetition detection) are ideas I learned from it and
   from other open-source engines. The implementations, their structure
   and their constants are FunComp's own; nothing is copied from another
   engine.
